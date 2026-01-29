@@ -1,14 +1,16 @@
 """
-Phase 2: Multi-Label Supervised Contrastive BiLSTM
---------------------------------------------------
+Phase 2: Multi-Label Supervised Contrastive BiLSTM + Prediction
+---------------------------------------------------------------
 
-Key constraints satisfied:
+Features:
 - Multi-label classification
 - Separate encoders for issue_description and action_summary
-- Priority to issue_description (action optional, down-weighted)
+- Priority to issue_description (action summary optional, down-weighted)
 - Test split: created_date_year >= 2025
-- Rows dropped if BOTH text fields are empty
-- Experimentation-only (no production cleanup)
+- Drop rows where BOTH text fields are empty
+- Contrastive representation learning
+- Frozen encoders + multi-label classifier
+- Single-sample prediction support
 """
 
 # =========================
@@ -147,6 +149,7 @@ class BiLSTMEncoder(nn.Module):
         h = torch.cat([h_n[-2], h_n[-1]], dim=1)
         return self.fc(h)
 
+
 class MultiLabelSupConLoss(nn.Module):
     def __init__(self, temperature=0.07):
         super().__init__()
@@ -166,21 +169,22 @@ class MultiLabelSupConLoss(nn.Module):
         mean_log_prob_pos = (mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         return -mean_log_prob_pos.mean()
 
+
+class MultiLabelHead(nn.Module):
+    def __init__(self, latent_dim, num_labels):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, num_labels)
+
+    def forward(self, z):
+        return torch.sigmoid(self.fc(z))
+
 # =========================
 # Pipeline
 # =========================
 
 class Phase2ContrastivePipeline:
-    def __init__(
-        self,
-        df,
-        issue_col,
-        action_col,
-        label_col,
-        year_col,
-        max_len=50,
-        device=None
-    ):
+    def __init__(self, df, issue_col, action_col, label_col, year_col,
+                 max_len=50, device=None):
         self.df = df.copy()
         self.issue_col = issue_col
         self.action_col = action_col
@@ -246,7 +250,6 @@ class Phase2ContrastivePipeline:
             action_ids, action_lens,
             self.y_train
         )
-
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         self.issue_encoder = BiLSTMEncoder(len(self.issue_vocab)+1).to(self.device)
@@ -268,7 +271,6 @@ class Phase2ContrastivePipeline:
 
                 z_issue = self.issue_encoder(i_ids, i_lens)
                 z_action = self.action_encoder(a_ids, a_lens)
-
                 z = z_issue + alpha * z_action
 
                 loss = criterion(z, labels)
@@ -279,7 +281,85 @@ class Phase2ContrastivePipeline:
 
                 total_loss += loss.item()
 
-            print(f"Epoch {epoch+1}/{epochs} | Loss={total_loss:.4f}")
+            print(f"[Contrastive] Epoch {epoch+1}/{epochs} | Loss={total_loss:.4f}")
+
+    def train_classifier(self, epochs=10, lr=1e-3, alpha=0.3):
+        for p in self.issue_encoder.parameters():
+            p.requires_grad = False
+        for p in self.action_encoder.parameters():
+            p.requires_grad = False
+
+        self.classifier = MultiLabelHead(
+            latent_dim=128,
+            num_labels=len(self.mlb.classes_)
+        ).to(self.device)
+
+        optimizer = torch.optim.Adam(self.classifier.parameters(), lr=lr)
+        criterion = nn.BCELoss()
+
+        issue_ids, issue_lens, _ = self._encode_text(self.train_df["issue_clean"])
+        action_ids, action_lens, _ = self._encode_text(self.train_df["action_clean"])
+
+        dataset = MultiLabelSequenceDataset(
+            issue_ids, issue_lens,
+            action_ids, action_lens,
+            self.y_train
+        )
+        loader = DataLoader(dataset, batch_size=128, shuffle=True)
+
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for i_ids, i_lens, a_ids, a_lens, labels in loader:
+                i_ids, i_lens = i_ids.to(self.device), i_lens.to(self.device)
+                a_ids, a_lens = a_ids.to(self.device), a_lens.to(self.device)
+                labels = labels.to(self.device)
+
+                with torch.no_grad():
+                    z_issue = self.issue_encoder(i_ids, i_lens)
+                    z_action = self.action_encoder(a_ids, a_lens)
+                    z = z_issue + alpha * z_action
+
+                preds = self.classifier(z)
+                loss = criterion(preds, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            print(f"[Classifier] Epoch {epoch+1}/{epochs} | Loss={total_loss:.4f}")
+
+    def predict_sample(self, issue_text, action_text=None, threshold=0.5, alpha=0.3):
+        issue_text = clean_text(issue_text)
+        action_text = clean_text(action_text) if action_text else ""
+
+        issue_ids, issue_lens, _ = self._encode_text(pd.Series([issue_text]))
+        action_ids, action_lens, _ = self._encode_text(pd.Series([action_text]))
+
+        self.issue_encoder.eval()
+        self.action_encoder.eval()
+        self.classifier.eval()
+
+        with torch.no_grad():
+            i_ids = torch.tensor(issue_ids).to(self.device)
+            i_lens = torch.tensor(issue_lens).to(self.device)
+            a_ids = torch.tensor(action_ids).to(self.device)
+            a_lens = torch.tensor(action_lens).to(self.device)
+
+            z_issue = self.issue_encoder(i_ids, i_lens)
+            z_action = self.action_encoder(a_ids, a_lens)
+            z = z_issue + alpha * z_action
+
+            probs = self.classifier(z).cpu().numpy()[0]
+
+        labels = self.mlb.classes_
+        predicted = [labels[i] for i, p in enumerate(probs) if p >= threshold]
+
+        return {
+            "predicted_labels": predicted,
+            "probabilities": dict(zip(labels, probs))
+        }
 
 # =========================
 # End-to-End Run
@@ -299,3 +379,11 @@ if __name__ == "__main__":
 
     pipeline.prepare_data()
     pipeline.train_contrastive(epochs=25)
+    pipeline.train_classifier(epochs=10)
+
+    result = pipeline.predict_sample(
+        issue_text="system timeout while processing batch",
+        action_text="increased memory allocation"
+    )
+
+    print(result)
