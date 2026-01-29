@@ -1,0 +1,301 @@
+"""
+Phase 2: Multi-Label Supervised Contrastive BiLSTM
+--------------------------------------------------
+
+Key constraints satisfied:
+- Multi-label classification
+- Separate encoders for issue_description and action_summary
+- Priority to issue_description (action optional, down-weighted)
+- Test split: created_date_year >= 2025
+- Rows dropped if BOTH text fields are empty
+- Experimentation-only (no production cleanup)
+"""
+
+# =========================
+# Imports
+# =========================
+
+import re
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MultiLabelBinarizer
+
+# =========================
+# Text Utilities
+# =========================
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_trigrams(text: str):
+    tokens = text.split()
+    if len(tokens) >= 3:
+        return ["_".join(tokens[i:i+3]) for i in range(len(tokens) - 2)]
+    elif len(tokens) > 0:
+        return ["_".join(tokens)]
+    else:
+        return ["<EMPTY>"]
+
+# =========================
+# TF-IDF Trigram Span Selector
+# =========================
+
+class TfidfTrigramSpanSelector:
+    def __init__(self, max_span_len=50):
+        self.max_span_len = max_span_len
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=(3, 3),
+            min_df=2,
+            max_df=0.9
+        )
+
+    def fit(self, texts):
+        self.vectorizer.fit(texts)
+        return self
+
+    def select_best_span(self, text):
+        tokens = text.split()
+        n = len(tokens)
+        if n < 3:
+            return text
+
+        trigrams = [" ".join(tokens[i:i+3]) for i in range(n - 2)]
+        tfidf_scores = self.vectorizer.transform(trigrams).sum(axis=1).A1
+
+        token_scores = np.zeros(n)
+        for i, score in enumerate(tfidf_scores):
+            token_scores[i] += score
+            token_scores[i+1] += score
+            token_scores[i+2] += score
+
+        best_sum = -1
+        curr_sum = 0
+        best_start = curr_start = 0
+
+        for i in range(n):
+            curr_sum += token_scores[i]
+            if i - curr_start + 1 > self.max_span_len:
+                curr_sum -= token_scores[curr_start]
+                curr_start += 1
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_start = curr_start
+                best_end = i
+            if curr_sum < 0:
+                curr_sum = 0
+                curr_start = i + 1
+
+        return " ".join(tokens[best_start:best_end+1])
+
+# =========================
+# Dataset
+# =========================
+
+class MultiLabelSequenceDataset(Dataset):
+    def __init__(self, issue_ids, issue_lens, action_ids, action_lens, labels):
+        self.issue_ids = torch.tensor(issue_ids, dtype=torch.long)
+        self.issue_lens = torch.tensor(issue_lens, dtype=torch.long)
+        self.action_ids = torch.tensor(action_ids, dtype=torch.long)
+        self.action_lens = torch.tensor(action_lens, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.float)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return (
+            self.issue_ids[idx], self.issue_lens[idx],
+            self.action_ids[idx], self.action_lens[idx],
+            self.labels[idx]
+        )
+
+# =========================
+# Model Components
+# =========================
+
+class BiLSTMEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128, latent_dim=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(
+            embed_dim,
+            hidden_dim,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.fc = nn.Linear(hidden_dim * 2, latent_dim)
+
+    def forward(self, input_ids, lengths):
+        emb = self.embedding(input_ids)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            emb, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        _, (h_n, _) = self.lstm(packed)
+        h = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        return self.fc(h)
+
+class MultiLabelSupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings, labels):
+        embeddings = F.normalize(embeddings, dim=1)
+        sim = torch.matmul(embeddings, embeddings.T) / self.temperature
+
+        label_sim = torch.matmul(labels, labels.T)
+        mask = (label_sim > 0).float().to(embeddings.device)
+        mask.fill_diagonal_(0)
+
+        exp_sim = torch.exp(sim) * (1 - torch.eye(sim.size(0)).to(sim.device))
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)
+
+        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        return -mean_log_prob_pos.mean()
+
+# =========================
+# Pipeline
+# =========================
+
+class Phase2ContrastivePipeline:
+    def __init__(
+        self,
+        df,
+        issue_col,
+        action_col,
+        label_col,
+        year_col,
+        max_len=50,
+        device=None
+    ):
+        self.df = df.copy()
+        self.issue_col = issue_col
+        self.action_col = action_col
+        self.label_col = label_col
+        self.year_col = year_col
+        self.max_len = max_len
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def prepare_data(self):
+        self.df["issue_clean"] = self.df[self.issue_col].apply(clean_text)
+        self.df["action_clean"] = self.df[self.action_col].apply(clean_text)
+
+        self.df = self.df[
+            (self.df["issue_clean"] != "") |
+            (self.df["action_clean"] != "")
+        ]
+
+        self.df["parsed_labels"] = self.df[self.label_col].apply(
+            lambda x: [i.strip() for i in x.split(",")] if isinstance(x, str) else []
+        )
+
+        self.train_df = self.df[self.df[self.year_col] < 2025]
+        self.test_df  = self.df[self.df[self.year_col] >= 2025]
+
+        self.mlb = MultiLabelBinarizer()
+        self.y_train = self.mlb.fit_transform(self.train_df["parsed_labels"])
+        self.y_test  = self.mlb.transform(self.test_df["parsed_labels"])
+
+        self.span_selector = TfidfTrigramSpanSelector(self.max_len)
+        self.span_selector.fit(self.train_df["issue_clean"].tolist())
+
+    def _encode_text(self, texts):
+        spans = texts.apply(self.span_selector.select_best_span)
+        trigs = spans.apply(extract_trigrams)
+
+        counter = Counter()
+        for t in trigs:
+            counter.update(t)
+
+        trigram_to_id = {t: i+1 for i, t in enumerate(counter)}
+
+        def encode(trigs):
+            ids = [trigram_to_id.get(t, 0) for t in trigs][:self.max_len]
+            l = len(ids)
+            return ids + [0]*(self.max_len-l), l
+
+        encoded = trigs.apply(encode)
+        ids = np.stack(encoded.apply(lambda x: x[0]))
+        lens = encoded.apply(lambda x: x[1]).values
+
+        return ids, lens, trigram_to_id
+
+    def train_contrastive(self, epochs=20, batch_size=128, alpha=0.3):
+        issue_ids, issue_lens, self.issue_vocab = self._encode_text(
+            self.train_df["issue_clean"]
+        )
+        action_ids, action_lens, self.action_vocab = self._encode_text(
+            self.train_df["action_clean"]
+        )
+
+        dataset = MultiLabelSequenceDataset(
+            issue_ids, issue_lens,
+            action_ids, action_lens,
+            self.y_train
+        )
+
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        self.issue_encoder = BiLSTMEncoder(len(self.issue_vocab)+1).to(self.device)
+        self.action_encoder = BiLSTMEncoder(len(self.action_vocab)+1).to(self.device)
+
+        criterion = MultiLabelSupConLoss()
+        optimizer = torch.optim.Adam(
+            list(self.issue_encoder.parameters()) +
+            list(self.action_encoder.parameters()),
+            lr=1e-3
+        )
+
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for i_ids, i_lens, a_ids, a_lens, labels in loader:
+                i_ids, i_lens = i_ids.to(self.device), i_lens.to(self.device)
+                a_ids, a_lens = a_ids.to(self.device), a_lens.to(self.device)
+                labels = labels.to(self.device)
+
+                z_issue = self.issue_encoder(i_ids, i_lens)
+                z_action = self.action_encoder(a_ids, a_lens)
+
+                z = z_issue + alpha * z_action
+
+                loss = criterion(z, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            print(f"Epoch {epoch+1}/{epochs} | Loss={total_loss:.4f}")
+
+# =========================
+# End-to-End Run
+# =========================
+
+if __name__ == "__main__":
+    df = pd.read_csv("your_data.csv")
+
+    pipeline = Phase2ContrastivePipeline(
+        df=df,
+        issue_col="issue_description",
+        action_col="action_summary",
+        label_col="root_cause",
+        year_col="created_date_year",
+        max_len=50
+    )
+
+    pipeline.prepare_data()
+    pipeline.train_contrastive(epochs=25)
