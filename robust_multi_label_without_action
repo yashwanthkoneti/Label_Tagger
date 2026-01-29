@@ -1,0 +1,311 @@
+# ============================================================
+# Phase 2: Robust Multi-Label Contrastive Pipeline (ONE FILE)
+# ============================================================
+
+import re
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def clean_text(text):
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_trigrams(text):
+    tokens = text.split()
+    if len(tokens) >= 3:
+        return ["_".join(tokens[i:i+3]) for i in range(len(tokens)-2)]
+    elif len(tokens) > 0:
+        return ["_".join(tokens)]
+    return ["<EMPTY>"]
+
+
+# ============================================================
+# TF-IDF Span Selector (Validated)
+# ============================================================
+
+class RobustTfidfSpanSelector:
+    def __init__(self, max_span_len=50):
+        self.max_span_len = max_span_len
+        self.vectorizer = TfidfVectorizer(ngram_range=(3,3), min_df=2, max_df=0.9)
+
+    def fit(self, texts):
+        self.vectorizer.fit(texts)
+        return self
+
+    def select(self, text):
+        tokens = text.split()
+        if len(tokens) < 5:
+            return text
+
+        trigrams = [" ".join(tokens[i:i+3]) for i in range(len(tokens)-2)]
+        scores = self.vectorizer.transform(trigrams).sum(axis=1).A1
+
+        token_scores = np.zeros(len(tokens))
+        for i, s in enumerate(scores):
+            token_scores[i:i+3] += s
+
+        best_sum, curr_sum = -1, 0
+        best_start, curr_start = 0, 0
+
+        for i in range(len(tokens)):
+            curr_sum += token_scores[i]
+            if i - curr_start + 1 > self.max_span_len:
+                curr_sum -= token_scores[curr_start]
+                curr_start += 1
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_start = curr_start
+                best_end = i
+
+        span = " ".join(tokens[best_start:best_end+1])
+        return span if len(span.split()) >= 3 else text
+
+
+# ============================================================
+# Dataset
+# ============================================================
+
+class MultiLabelDataset(Dataset):
+    def __init__(self, issue_ids, issue_lens, labels):
+        self.issue_ids = torch.tensor(issue_ids, dtype=torch.long)
+        self.issue_lens = torch.tensor(issue_lens, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.float)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.issue_ids[idx], self.issue_lens[idx], self.labels[idx]
+
+
+# ============================================================
+# Encoder
+# ============================================================
+
+class BiLSTMEncoder(nn.Module):
+    def __init__(self, vocab_size, emb=128, hid=128, out=128):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, emb, padding_idx=0)
+        self.lstm = nn.LSTM(emb, hid, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(hid*2, out)
+
+    def forward(self, ids, lens):
+        x = self.emb(ids)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lens.cpu(), batch_first=True, enforce_sorted=False
+        )
+        _, (h, _) = self.lstm(packed)
+        z = torch.cat([h[-2], h[-1]], dim=1)
+        return self.fc(z)
+
+
+# ============================================================
+# Competitive Soft Contrastive Loss
+# ============================================================
+
+class CompetitiveSoftContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.2, gamma=3.0):
+        super().__init__()
+        self.tau = temperature
+        self.gamma = gamma
+
+    def forward(self, z, y):
+        z = F.normalize(z, dim=1)
+        sim = torch.matmul(z, z.T) / self.tau
+        sim -= sim.max(dim=1, keepdim=True)[0]
+
+        # label overlap (competition)
+        dot = torch.matmul(y, y.T)
+        norm = y.norm(dim=1, keepdim=True)
+        label_sim = dot / (norm @ norm.T + 1e-8)
+        mask = torch.pow(label_sim, self.gamma)
+
+        eye = torch.eye(z.size(0), device=z.device)
+        mask = mask * (1 - eye)
+        sim = sim * (1 - eye)
+
+        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+        loss = -(mask * log_prob).sum() / (mask.sum() + 1e-8)
+        return loss
+
+
+# ============================================================
+# Label Noise Injection
+# ============================================================
+
+def inject_label_noise(y, p=0.1):
+    if p <= 0:
+        return y
+    noise = torch.rand_like(y)
+    y = y.clone()
+    y[noise < p] = 0
+    return y
+
+
+# ============================================================
+# Hit / Miss Metric (ANY LABEL MATCH)
+# ============================================================
+
+def hit_accuracy(y_true, y_pred):
+    """
+    HIT if intersection(y_true, y_pred) != empty
+    """
+    hits = []
+    for t, p in zip(y_true, y_pred):
+        hits.append(int(np.any((t == 1) & (p == 1))))
+    return np.mean(hits)
+
+
+# ============================================================
+# Pipeline
+# ============================================================
+
+class RobustContrastivePipeline:
+    def __init__(self, df, text_col, label_col, year_col, device=None):
+        self.df = df.copy()
+        self.text_col = text_col
+        self.label_col = label_col
+        self.year_col = year_col
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    def prepare(self):
+        self.df["text"] = self.df[self.text_col].apply(clean_text)
+        self.df = self.df[self.df["text"] != ""]
+
+        self.df["labels"] = self.df[self.label_col].apply(
+            lambda x: [i.strip() for i in x.split(",")] if isinstance(x, str) else []
+        )
+
+        train_df = self.df[self.df[self.year_col] < 2025]
+        test_df  = self.df[self.df[self.year_col] >= 2025]
+
+        self.mlb = MultiLabelBinarizer()
+        self.y_train = self.mlb.fit_transform(train_df["labels"])
+        self.y_test  = self.mlb.transform(test_df["labels"])
+
+        self.selector = RobustTfidfSpanSelector()
+        self.selector.fit(train_df["text"].tolist())
+
+        self.train_text = train_df["text"]
+        self.test_text  = test_df["text"]
+
+    def encode(self, texts):
+        spans = texts.apply(self.selector.select)
+        trigs = spans.apply(extract_trigrams)
+
+        vocab = Counter()
+        for t in trigs:
+            vocab.update(t)
+
+        tok2id = {t:i+1 for i,t in enumerate(vocab)}
+
+        def enc(t):
+            ids = [tok2id.get(x,0) for x in t][:50]
+            return ids + [0]*(50-len(ids)), len(ids)
+
+        encs = trigs.apply(enc)
+        ids = np.stack(encs.apply(lambda x:x[0]))
+        lens = encs.apply(lambda x:x[1]).values
+
+        return ids, lens, tok2id
+
+    def train_contrastive(self, epochs=12, batch=128):
+        X_ids, X_lens, self.vocab = self.encode(self.train_text)
+
+        ds = MultiLabelDataset(X_ids, X_lens, self.y_train)
+        dl = DataLoader(ds, batch_size=batch, shuffle=True)
+
+        self.encoder = BiLSTMEncoder(len(self.vocab)+1).to(self.device)
+        loss_fn = CompetitiveSoftContrastiveLoss()
+        opt = torch.optim.Adam(self.encoder.parameters(), lr=1e-3)
+
+        for ep in range(epochs):
+            total = 0
+            for ids, lens, y in dl:
+                ids, lens, y = ids.to(self.device), lens.to(self.device), y.to(self.device)
+                y = inject_label_noise(y, 0.1)
+
+                z = self.encoder(ids, lens)
+                loss = loss_fn(z, y)
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                total += loss.item()
+
+            print(f"[Contrastive] Epoch {ep+1} | Loss={total:.3f}")
+
+    def evaluate_hit_metric(self):
+        # ---- train embeddings
+        tr_ids, tr_lens, _ = self.encode(self.train_text)
+        te_ids, te_lens, _ = self.encode(self.test_text)
+
+        with torch.no_grad():
+            Ztr = self.encoder(
+                torch.tensor(tr_ids).to(self.device),
+                torch.tensor(tr_lens).to(self.device)
+            ).cpu().numpy()
+
+            Zte = self.encoder(
+                torch.tensor(te_ids).to(self.device),
+                torch.tensor(te_lens).to(self.device)
+            ).cpu().numpy()
+
+        # ---- centroid classifier
+        cents = {}
+        for i in range(self.y_train.shape[1]):
+            idx = self.y_train[:, i] == 1
+            if idx.sum() > 0:
+                cents[i] = Ztr[idx].mean(axis=0)
+
+        def predict(Z):
+            preds = []
+            for z in Z:
+                sims = np.array([np.dot(z, c) for c in cents.values()])
+                y = np.zeros(len(cents))
+                y[sims.argmax()] = 1
+                preds.append(y)
+            return np.array(preds)
+
+        ytr_pred = predict(Ztr)
+        yte_pred = predict(Zte)
+
+        print("Train HIT accuracy:", hit_accuracy(self.y_train, ytr_pred))
+        print("Test  HIT accuracy:", hit_accuracy(self.y_test, yte_pred))
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    df = pd.read_csv("your_data.csv")
+
+    pipe = RobustContrastivePipeline(
+        df,
+        text_col="issue_description",
+        label_col="root_cause",
+        year_col="created_date_year"
+    )
+
+    pipe.prepare()
+    pipe.train_contrastive()
+    pipe.evaluate_hit_metric()
