@@ -406,36 +406,51 @@ class Phase2ContrastivePipeline:
         return metrics
 
 
-    def predict_sample(self, issue_text, action_text=None, threshold=0.5, alpha=0.3):
-        issue_text = clean_text(issue_text)
-        action_text = clean_text(action_text) if action_text else ""
+def predict_sample(
+    self,
+    issue_text,
+    action_text=None,
+    alpha=0.3,
+    threshold=0.5,
+    decision_mode="threshold"  # or "max"
+):
+    issue_text = clean_text(issue_text)
+    action_text = clean_text(action_text) if action_text else ""
 
-        issue_ids, issue_lens, _ = self._encode_text(pd.Series([issue_text]))
-        action_ids, action_lens, _ = self._encode_text(pd.Series([action_text]))
+    issue_ids, issue_lens, _ = self._encode_text(pd.Series([issue_text]))
+    action_ids, action_lens, _ = self._encode_text(pd.Series([action_text]))
 
-        self.issue_encoder.eval()
-        self.action_encoder.eval()
-        self.classifier.eval()
+    self.issue_encoder.eval()
+    self.action_encoder.eval()
+    self.classifier.eval()
 
-        with torch.no_grad():
-            i_ids = torch.tensor(issue_ids).to(self.device)
-            i_lens = torch.tensor(issue_lens).to(self.device)
-            a_ids = torch.tensor(action_ids).to(self.device)
-            a_lens = torch.tensor(action_lens).to(self.device)
+    with torch.no_grad():
+        i_ids = torch.tensor(issue_ids).to(self.device)
+        i_lens = torch.tensor(issue_lens).to(self.device)
+        a_ids = torch.tensor(action_ids).to(self.device)
+        a_lens = torch.tensor(action_lens).to(self.device)
 
-            z_issue = self.issue_encoder(i_ids, i_lens)
-            z_action = self.action_encoder(a_ids, a_lens)
-            z = z_issue + alpha * z_action
+        z_issue = self.issue_encoder(i_ids, i_lens)
+        z_action = self.action_encoder(a_ids, a_lens)
+        z = z_issue + alpha * z_action
 
-            probs = self.classifier(z).cpu().numpy()[0]
+        probs = self.classifier(z).cpu().numpy()[0]
 
-        labels = self.mlb.classes_
+    labels = self.mlb.classes_
+
+    # ---- decision logic (NEW)
+    if decision_mode == "max":
+        max_idx = probs.argmax()
+        predicted = [labels[max_idx]]
+    else:
         predicted = [labels[i] for i, p in enumerate(probs) if p >= threshold]
 
-        return {
-            "predicted_labels": predicted,
-            "probabilities": dict(zip(labels, probs))
-        }
+    return {
+        "predicted_labels": predicted,
+        "probabilities": dict(zip(labels, probs)),
+        "decision_mode": decision_mode
+    }
+
 
 # =========================
 # End-to-End Run
