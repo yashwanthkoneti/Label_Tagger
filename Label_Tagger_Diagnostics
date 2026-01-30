@@ -1,0 +1,577 @@
+# ============================================================
+# Domain-Aware BiLSTM Classification Pipeline
+# ============================================================
+# Design goals:
+# - Small / medium enterprise dataset
+# - Domain-sensitive language
+# - No transformers, no attention
+# - Reduce noise BEFORE modeling
+# - Sequential inductive bias via BiLSTM
+# - Interpretable and debuggable
+# ============================================================
+
+# =========================
+# Imports
+# =========================
+
+import re
+import numpy as np
+import pandas as pd
+from collections import Counter
+import matplotlib.pyplot as plt
+
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+from sklearn.decomposition import PCA
+
+
+# =========================
+# Configuration
+# =========================
+
+MAX_SEQ_LEN = 50
+LATENT_DIM = 24
+EMBED_DIM = 128
+HIDDEN_DIM = 128
+BATCH_SIZE = 128
+EPOCHS = 20
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# =========================
+# 1. Text Normalization
+# =========================
+# Purpose:
+# Reduce lexical noise BEFORE modeling.
+# This matters a lot for small datasets.
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def simple_lemmatize(tokens):
+    """
+    Lightweight lemmatization.
+    Intentionally simple to avoid heavy dependencies.
+    """
+    suffixes = ["ing", "ed", "s"]
+    out = []
+    for t in tokens:
+        for suf in suffixes:
+            if t.endswith(suf) and len(t) > len(suf) + 2:
+                t = t[:-len(suf)]
+        out.append(t)
+    return out
+
+
+# =========================
+# 2. Importance-Aware Token Selection
+# =========================
+# Purpose:
+# Not all words are equally informative.
+# TF-IDF is used ONLY to decide which tokens to keep.
+
+class TokenImportanceFilter:
+    def __init__(self, top_k=30):
+        self.top_k = top_k
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=(1, 1),
+            min_df=2,
+            max_df=0.9
+        )
+
+    def fit(self, texts):
+        self.vectorizer.fit(texts)
+
+    def filter_tokens(self, text):
+        tokens = text.split()
+        if not tokens:
+            return []
+
+        tfidf_scores = self.vectorizer.transform([" ".join(tokens)])
+        vocab = self.vectorizer.get_feature_names_out()
+
+        scores = {
+            vocab[i]: tfidf_scores[0, i]
+            for i in tfidf_scores.nonzero()[1]
+        }
+
+        # Keep top-K important tokens, preserve original order
+        ranked = sorted(scores, key=scores.get, reverse=True)[: self.top_k]
+        return [t for t in tokens if t in ranked]
+		
+    def explain(self, text, top_n=10):
+        """
+        Returns token → tf-idf score for a given text
+        """
+        tokens = text.split()
+        if not tokens:
+            return {}
+
+        tfidf_scores = self.vectorizer.transform([" ".join(tokens)])
+        vocab = self.vectorizer.get_feature_names_out()
+
+        scores = {
+            vocab[i]: float(tfidf_scores[0, i])
+            for i in tfidf_scores.nonzero()[1]
+        }
+
+        # Sort by importance
+        return dict(
+            sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        )
+
+
+# =========================
+# 3. Dataset Wrapper
+# =========================
+
+class SequenceDataset(Dataset):
+    def __init__(self, sequences, lengths, labels):
+        self.sequences = torch.tensor(sequences, dtype=torch.long)
+        self.lengths = torch.tensor(lengths, dtype=torch.long)
+        self.labels = torch.tensor(labels, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return (
+            self.sequences[idx],
+            self.lengths[idx],
+            self.labels[idx]
+        )
+
+
+# =========================
+# 4. Vocabulary Utilities
+# =========================
+
+def build_vocab(token_lists):
+    counter = Counter()
+    for toks in token_lists:
+        counter.update(toks)
+    # 0 reserved for PAD
+    return {t: i + 1 for i, t in enumerate(counter)}
+
+
+def encode_tokens(tokens, vocab):
+    ids = [vocab.get(t, 0) for t in tokens][:MAX_SEQ_LEN]
+    length = len(ids)
+    ids += [0] * (MAX_SEQ_LEN - length)
+    return ids, length
+
+
+# =========================
+# 5. BiLSTM Encoder
+# =========================
+# Purpose:
+# Capture order + local context.
+# No attention, no decoder.
+
+class BiLSTMEncoder(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            vocab_size,
+            EMBED_DIM,
+            padding_idx=0
+        )
+        self.lstm = nn.LSTM(
+            EMBED_DIM,
+            HIDDEN_DIM,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.fc = nn.Linear(HIDDEN_DIM * 2, LATENT_DIM)
+
+    def forward(self, x, lengths):
+        emb = self.embedding(x)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            emb,
+            lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False
+        )
+        _, (h_n, _) = self.lstm(packed)
+        h = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        return self.fc(h)
+
+
+# =========================
+# 6. Multi-Label Classifier
+# =========================
+
+class MultiLabelHead(nn.Module):
+    def __init__(self, num_labels):
+        super().__init__()
+        self.fc = nn.Linear(LATENT_DIM, num_labels)
+
+    def forward(self, z):
+        return torch.sigmoid(self.fc(z))
+
+
+# =========================
+# 7. End-to-End Pipeline
+# =========================
+
+class DomainContrastivePipeline:
+    def __init__(self, df, text_col, label_col):
+        self.df = df.copy()
+        self.text_col = text_col
+        self.label_col = label_col
+
+    def prepare(self):
+        # ---- Clean text
+        self.df["clean"] = self.df[self.text_col].apply(clean_text)
+
+        # ---- Tokenize + lemmatize
+        self.df["tokens"] = self.df["clean"].apply(
+            lambda x: simple_lemmatize(x.split())
+        )
+
+        # ---- Train / test split
+        self.train_df, self.test_df = train_test_split(
+            self.df,
+            test_size=0.2,
+            random_state=42
+        )
+
+        # ---- Importance filtering (fit on TRAIN only)
+        self.token_filter = TokenImportanceFilter()
+        self.token_filter.fit(self.train_df["clean"].tolist())
+
+        self.train_df["tokens"] = self.train_df["clean"].apply(
+            self.token_filter.filter_tokens
+        )
+        self.test_df["tokens"] = self.test_df["clean"].apply(
+            self.token_filter.filter_tokens
+        )
+
+        # ---- Vocabulary
+        self.vocab = build_vocab(self.train_df["tokens"])
+
+        # ---- Encode sequences
+        def encode_df(df_part):
+            seqs, lens = [], []
+            for toks in df_part["tokens"]:
+                s, l = encode_tokens(toks, self.vocab)
+                seqs.append(s)
+                lens.append(l)
+            return np.array(seqs), np.array(lens)
+
+        self.X_train, self.L_train = encode_df(self.train_df)
+        self.X_test, self.L_test = encode_df(self.test_df)
+
+        # ---- Labels
+        self.mlb = MultiLabelBinarizer()
+        self.y_train = self.mlb.fit_transform(
+            self.train_df[self.label_col]
+        )
+        self.y_test = self.mlb.transform(
+            self.test_df[self.label_col]
+        )
+
+    def train(self):
+        self.encoder = BiLSTMEncoder(len(self.vocab) + 1).to(DEVICE)
+        self.classifier = MultiLabelHead(
+            len(self.mlb.classes_)
+        ).to(DEVICE)
+
+        dataset = SequenceDataset(
+            self.X_train,
+            self.L_train,
+            self.y_train
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True
+        )
+
+        optimizer = torch.optim.Adam(
+            list(self.encoder.parameters()) +
+            list(self.classifier.parameters()),
+            lr=1e-3
+        )
+        criterion = nn.BCELoss()
+
+        for epoch in range(EPOCHS):
+            self.encoder.train()
+            self.classifier.train()
+
+            for x, l, y in loader:
+                x, l, y = (
+                    x.to(DEVICE),
+                    l.to(DEVICE),
+                    y.to(DEVICE)
+                )
+
+                z = self.encoder(x, l)
+                preds = self.classifier(z)
+
+                loss = criterion(preds, y)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            # ---- Strict evaluation
+            self.encoder.eval()
+            self.classifier.eval()
+
+            with torch.no_grad():
+                zt = self.encoder(
+                    torch.tensor(self.X_test).to(DEVICE),
+                    torch.tensor(self.L_test).to(DEVICE)
+                )
+                pt = self.classifier(zt).cpu().numpy()
+
+            f1 = f1_score(
+                self.y_test,
+                pt > 0.5,
+                average="micro"
+            )
+            print(
+                f"Epoch {epoch + 1} | Test Micro-F1: {f1:.3f}"
+            )
+
+    def predict(self, text):
+        text = clean_text(text)
+        tokens = simple_lemmatize(text.split())
+        tokens = self.token_filter.filter_tokens(
+            " ".join(tokens)
+        )
+
+        ids, l = encode_tokens(tokens, self.vocab)
+        ids = torch.tensor([ids]).to(DEVICE)
+        l = torch.tensor([l]).to(DEVICE)
+
+        self.encoder.eval()
+        self.classifier.eval()
+
+        with torch.no_grad():
+            z = self.encoder(ids, l)
+            probs = self.classifier(z).cpu().numpy()[0]
+
+        return dict(zip(self.mlb.classes_, probs))
+		
+	def inspect_token_filtering(self, n_samples=5):
+    	"""
+    	Show raw vs retained tokens for a few samples.
+    	"""
+    	samples = self.train_df.sample(n_samples, random_state=42)
+
+    	for idx, row in samples.iterrows():
+        	raw = row["clean"]
+        	retained = row["tokens"]
+        	importance = self.token_filter.explain(raw)
+
+        	print("=" * 80)
+        	print("RAW TEXT:")
+        	print(raw)
+        	print("\nTF-IDF IMPORTANT TOKENS:")
+        	print(importance)
+        	print("\nTOKENS PASSED TO MODEL:")
+        	print(retained)
+			
+	def latent_variance_diagnostic(self):
+    	"""
+    	Checks variance of each latent dimension on train data.
+    	"""
+    	self.encoder.eval()
+
+    	with torch.no_grad():
+        	z = self.encoder(
+            	torch.tensor(self.X_train).to(DEVICE),
+            	torch.tensor(self.L_train).to(DEVICE)
+        	).cpu().numpy()
+
+    	variances = z.var(axis=0)
+
+    	summary = {
+        	"min_variance": float(variances.min()),
+        	"mean_variance": float(variances.mean()),
+        	"max_variance": float(variances.max()),
+        	"near_zero_dims": int((variances < 1e-4).sum())
+    	}
+
+    	return variances, summary
+
+	def latent_dimension_importance(self):
+    	"""
+    	Uses classifier weights to estimate latent dimension importance.
+    	"""
+    	weights = self.classifier.fc.weight.detach().cpu().numpy()
+    	importance = np.mean(np.abs(weights), axis=0)
+
+    	ranked = sorted(
+        	enumerate(importance),
+        	key=lambda x: x[1],
+        	reverse=True
+    	)
+
+    	return ranked
+		
+	def _encode_split(self, split="train"):
+    	self.encoder.eval()
+    	if split == "train":
+        	X, L = self.X_train, self.L_train
+    	else:
+        	X, L = self.X_test, self.L_test
+
+	    with torch.no_grad():
+    	    z = self.encoder(
+        	    torch.tensor(X).to(DEVICE),
+           	 	torch.tensor(L).to(DEVICE)
+        	).cpu().numpy()
+
+	    return z
+
+		
+	def latent_drift_diagnostic(self):
+    	"""
+    	Compares latent distributions between train and test.
+    	"""
+    	z_train = self._encode_split("train")
+    	z_test = self._encode_split("test")
+
+    	drift = {
+     	   "mean_shift_l2": float(
+     	       np.linalg.norm(z_train.mean(axis=0) - z_test.mean(axis=0))
+     	   ),
+     	   "std_shift_l2": float(
+     	       np.linalg.norm(z_train.std(axis=0) - z_test.std(axis=0))
+      	  ),
+      	  "train_var_mean": float(z_train.var(axis=0).mean()),
+      	  "test_var_mean": float(z_test.var(axis=0).mean()),
+    	}
+
+    	return drift
+
+
+	def latent_dimension_drift(self):
+    	z_train = self._encode_split("train")
+    	z_test = self._encode_split("test")
+
+    	drift_per_dim = np.abs(
+        	z_train.mean(axis=0) - z_test.mean(axis=0)
+    	)
+
+    	ranked = sorted(
+        	enumerate(drift_per_dim),
+        	key=lambda x: x[1],
+        	reverse=True
+    	)
+
+    	return ranked
+		
+	def label_centroids(self, split="train"):
+    	z = self._encode_split(split)
+    	y = self.y_train if split == "train" else self.y_test
+
+    	centroids = {}
+
+    	for i, label in enumerate(self.mlb.classes_):
+        	mask = y[:, i] == 1
+        	if mask.sum() < 5:
+            	continue
+        	centroids[label] = z[mask].mean(axis=0)
+
+    	return centroids
+		
+	def label_centroid_shift(self):
+    	train_c = self.label_centroids("train")
+    	test_c = self.label_centroids("test")
+
+    	shifts = {}
+
+    	for label in train_c:
+        	if label in test_c:
+            	shifts[label] = float(
+                	np.linalg.norm(train_c[label] - test_c[label])
+            	)
+
+	    return dict(sorted(shifts.items(), key=lambda x: x[1], reverse=True))
+		
+		
+
+	def plot_label_centroids(self):
+    	train_c = self.label_centroids("train")
+    	test_c = self.label_centroids("test")
+
+    	labels = list(train_c.keys())
+    	X = np.vstack([train_c[l] for l in labels] +
+        	          [test_c[l] for l in labels])
+
+	    pca = PCA(n_components=2)
+    	X_2d = pca.fit_transform(X)
+
+	    n = len(labels)
+    	train_pts = X_2d[:n]
+	    test_pts = X_2d[n:]
+
+    	plt.figure(figsize=(8, 6))
+	    for i, label in enumerate(labels):
+    	    plt.scatter(*train_pts[i], color="blue")
+        	plt.scatter(*test_pts[i], color="red")
+	        plt.plot(
+    	        [train_pts[i][0], test_pts[i][0]],
+        	    [train_pts[i][1], test_pts[i][1]],
+            	linestyle="dashed"
+	        )
+    	    plt.text(train_pts[i][0], train_pts[i][1], label)
+
+	    plt.title("Label Centroids: Train (Blue) vs Test (Red)")
+    	plt.show()
+
+
+
+		
+
+# =========================
+# Example Usage
+# =========================
+"""
+df must contain:
+- text column (string)
+- label column (list of labels)
+"""
+
+pipeline = DomainContrastivePipeline(df, "description", "labels")
+pipeline.prepare()
+pipeline.train()
+pipeline.predict("job failed due to timeout during reconciliation")
+
+pipeline.inspect_token_filtering(n_samples=3)
+
+variances, summary = pipeline.latent_variance_diagnostic()
+print(summary)
+
+sep = pipeline.label_separability_diagnostic()
+print(sep)
+
+important_dims = pipeline.latent_dimension_importance()
+print(important_dims[:5])
+
+print(pipeline.latent_drift_diagnostic())
+
+
+print(pipeline.latent_dimension_drift()[:5])
+
+print(pipeline.label_centroid_shift())
+
+pipeline.plot_label_centroids()
+
+
+
+
