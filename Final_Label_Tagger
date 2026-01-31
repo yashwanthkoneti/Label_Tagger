@@ -1,7 +1,8 @@
 import re
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import List
+from itertools import combinations
 
 
 class TextPreprocessor:
@@ -87,3 +88,110 @@ class TextPreprocessor:
         if token.endswith("s") and len(token) > 3:
             return token[:-1]
         return token
+
+class LabelStructureDiscovery:
+    """
+    Phase 3: Label Structure Discovery
+
+    Goal:
+    - Discover stable co-occurrence structure between labels
+    - Reduce label noise by grouping semantically related labels
+    - Produce soft groups (not hard clusters) for downstream use
+    """
+
+    def __init__(
+        self,
+        min_support=0.05,
+        min_confidence=0.3,
+        max_group_size=4
+    ):
+        self.min_support = min_support
+        self.min_confidence = min_confidence
+        self.max_group_size = max_group_size
+
+        self.label_support = Counter()
+        self.pair_support = Counter()
+        self.groups = defaultdict(set)
+
+        self.fitted = False
+
+    def fit(self, label_sets):
+        """
+        label_sets:
+        List of label collections per training sample.
+        Each element should be a set or list of labels.
+        """
+
+        num_samples = len(label_sets)
+
+        # Count individual label frequency
+        # and pairwise co-occurrence frequency
+        for labels in label_sets:
+            unique_labels = set(labels)
+
+            for label in unique_labels:
+                self.label_support[label] += 1
+
+            for a, b in combinations(sorted(unique_labels), 2):
+                self.pair_support[(a, b)] += 1
+
+        self._build_groups(num_samples)
+        self.fitted = True
+        return self
+
+    def get_label_groups(self):
+        """
+        Returns soft neighborhood for each label.
+        """
+        if not self.fitted:
+            raise RuntimeError("fit() must be called before accessing groups")
+        return dict(self.groups)
+
+    def get_association_strength(self):
+        """
+        Returns asymmetric association strength between label pairs.
+        Can be used later for soft contrastive weighting.
+        """
+        strength = {}
+
+        for (a, b), count in self.pair_support.items():
+            conf_ab = count / self.label_support[a]
+            conf_ba = count / self.label_support[b]
+            strength[(a, b)] = max(conf_ab, conf_ba)
+
+        return strength
+
+    def _build_groups(self, num_samples):
+        """
+        Core Apriori-style logic:
+        - Filter by minimum support
+        - Apply confidence threshold
+        - Build directional neighborhoods
+        """
+
+        min_count = int(self.min_support * num_samples)
+
+        for (a, b), count in self.pair_support.items():
+            if count < min_count:
+                continue
+
+            conf_ab = count / self.label_support[a]
+            conf_ba = count / self.label_support[b]
+
+            if conf_ab >= self.min_confidence:
+                self.groups[a].add(b)
+
+            if conf_ba >= self.min_confidence:
+                self.groups[b].add(a)
+
+        self._prune_groups()
+
+    def _prune_groups(self):
+        """
+        Prevents any single label from forming an overly large group.
+        This avoids collapsing representation space later.
+        """
+        for label in list(self.groups.keys()):
+            neighbors = list(self.groups[label])
+            if len(neighbors) > self.max_group_size:
+                self.groups[label] = set(neighbors[: self.max_group_size])
