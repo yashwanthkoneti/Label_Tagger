@@ -181,3 +181,190 @@ class LabelGraphDiscovery:
                 self.graph[label] = {}
 
             self.graph[label][label] = 1.0
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
+
+class WindowGenerator:
+    def __init__(self, window_size=25, stride=10):
+        self.window_size = window_size
+        self.stride = stride
+
+    def generate(self, tokens):
+        windows = []
+        for start in range(0, len(tokens), self.stride):
+            window = tokens[start:start + self.window_size]
+            if len(window) > 0:
+                windows.append(window)
+        return windows
+
+class Vocabulary:
+    def __init__(self, min_freq=2):
+        self.min_freq = min_freq
+        self.token_to_id = {"<PAD>": 0, "<UNK>": 1}
+        self.id_to_token = {0: "<PAD>", 1: "<UNK>"}
+
+    def fit(self, documents):
+        freq = defaultdict(int)
+        for tokens in documents:
+            for t in tokens:
+                freq[t] += 1
+
+        for token, count in freq.items():
+            if count >= self.min_freq:
+                idx = len(self.token_to_id)
+                self.token_to_id[token] = idx
+                self.id_to_token[idx] = token
+
+    def encode(self, tokens, max_len):
+        ids = [self.token_to_id.get(t, 1) for t in tokens[:max_len]]
+        length = len(ids)
+        ids += [0] * (max_len - length)
+        return ids, length
+
+
+class WindowDataset(Dataset):
+    def __init__(self, windows, lengths, doc_ids, labels):
+        self.windows = torch.tensor(windows, dtype=torch.long)
+        self.lengths = torch.tensor(lengths, dtype=torch.long)
+        self.doc_ids = torch.tensor(doc_ids, dtype=torch.long)
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        return (
+            self.windows[idx],
+            self.lengths[idx],
+            self.doc_ids[idx],
+            self.labels[idx]
+        )
+
+class BiLSTMEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, latent_dim=24):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(
+            embed_dim,
+            hidden_dim,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.proj = nn.Linear(hidden_dim * 2, latent_dim)
+
+    def forward(self, input_ids, lengths):
+        emb = self.embedding(input_ids)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            emb, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        _, (h, _) = self.lstm(packed)
+        h_cat = torch.cat([h[-2], h[-1]], dim=1)
+        return self.proj(h_cat)
+
+class WeightedSupConLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings, doc_ids, labels, label_graph):
+        z = F.normalize(embeddings, dim=1)
+        sim = torch.matmul(z, z.T) / self.temperature
+
+        loss = 0.0
+        count = 0
+
+        for i in range(len(z)):
+            weights = torch.zeros(len(z), device=z.device)
+
+            for j in range(len(z)):
+                if i == j:
+                    continue
+
+                if doc_ids[i] == doc_ids[j]:
+                    weights[j] = 1.0
+
+                elif labels[i] == labels[j]:
+                    weights[j] = 0.7
+
+                else:
+                    w = label_graph.get(labels[i], {}).get(labels[j], 0.0)
+                    if w > 0:
+                        weights[j] = 0.2 * w
+
+            if weights.sum() == 0:
+                continue
+
+            numerator = torch.exp(sim[i]) * weights
+            denominator = torch.exp(sim[i]).sum()
+            loss -= torch.log(numerator.sum() / denominator)
+            count += 1
+
+        return loss / max(count, 1)
+
+def train_contrastive(
+    dataset,
+    vocab_size,
+    label_graph,
+    epochs=10,
+    batch_size=128,
+    lr=1e-3,
+    device="cpu"
+):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    model = BiLSTMEncoder(vocab_size).to(device)
+    criterion = WeightedSupConLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(epochs):
+        total = 0.0
+        for ids, lens, doc_ids, labels in loader:
+            ids = ids.to(device)
+            lens = lens.to(device)
+
+            z = model(ids, lens)
+            loss = criterion(z, doc_ids, labels, label_graph)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total += loss.item()
+
+        print(f"Epoch {epoch+1} | Loss {total:.4f}")
+
+    return model
+
+def aggregate_document_embeddings(window_embeddings, doc_ids):
+    doc_map = defaultdict(list)
+
+    for z, d in zip(window_embeddings, doc_ids):
+        doc_map[d].append(z)
+
+    doc_embeddings = {}
+    for d, vecs in doc_map.items():
+        vecs = torch.stack(vecs)
+        norms = torch.norm(vecs, dim=1)
+        topk = vecs[norms.topk(k=min(5, len(vecs))).indices]
+        doc_embeddings[d] = topk.mean(dim=0)
+
+    return doc_embeddings
+
+from sklearn.linear_model import LogisticRegression
+
+def train_classifier(doc_embeddings, labels):
+    X = []
+    y = []
+    for doc_id, emb in doc_embeddings.items():
+        X.append(emb.detach().cpu().numpy())
+        y.append(labels[doc_id])
+
+    clf = LogisticRegression(max_iter=500)
+    clf.fit(X, y)
+    return clf
+
