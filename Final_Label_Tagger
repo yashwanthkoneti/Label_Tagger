@@ -89,43 +89,45 @@ class TextPreprocessor:
             return token[:-1]
         return token
 
-class LabelStructureDiscovery:
-    """
-    Phase 3: Label Structure Discovery
+from itertools import combinations
+from collections import Counter, defaultdict
 
-    Goal:
-    - Discover stable co-occurrence structure between labels
-    - Reduce label noise by grouping semantically related labels
-    - Produce soft groups (not hard clusters) for downstream use
+
+class LabelGraphDiscovery:
+    """
+    Phase 3: Label Graph Discovery
+
+    Builds a weighted, directed label graph where:
+    - nodes are labels
+    - edges represent co-occurrence strength
+    - weights encode confidence of association
+
+    This avoids hard grouping and supports overlapping semantics naturally.
     """
 
     def __init__(
         self,
-        min_support=0.05,
-        min_confidence=0.3,
-        max_group_size=4
+        min_support=0.02,
+        min_confidence=0.05
     ):
         self.min_support = min_support
         self.min_confidence = min_confidence
-        self.max_group_size = max_group_size
 
         self.label_support = Counter()
         self.pair_support = Counter()
-        self.groups = defaultdict(set)
+        self.graph = defaultdict(dict)
 
         self.fitted = False
 
     def fit(self, label_sets):
         """
         label_sets:
-        List of label collections per training sample.
-        Each element should be a set or list of labels.
+        Iterable of label collections (list or set) per training sample.
+        TRAIN DATA ONLY.
         """
 
         num_samples = len(label_sets)
 
-        # Count individual label frequency
-        # and pairwise co-occurrence frequency
         for labels in label_sets:
             unique_labels = set(labels)
 
@@ -135,40 +137,25 @@ class LabelStructureDiscovery:
             for a, b in combinations(sorted(unique_labels), 2):
                 self.pair_support[(a, b)] += 1
 
-        self._build_groups(num_samples)
+        self._build_graph(num_samples)
+        self._ensure_self_loops()
         self.fitted = True
         return self
 
-    def get_label_groups(self):
-        """
-        Returns soft neighborhood for each label.
-        """
+    def get_graph(self):
         if not self.fitted:
-            raise RuntimeError("fit() must be called before accessing groups")
-        return dict(self.groups)
+            raise RuntimeError("fit() must be called before accessing graph")
+        return dict(self.graph)
 
-    def get_association_strength(self):
+    def get_neighbors(self, label):
+        if not self.fitted:
+            raise RuntimeError("fit() must be called before querying graph")
+        return self.graph.get(label, {})
+
+    def _build_graph(self, num_samples):
         """
-        Returns asymmetric association strength between label pairs.
-        Can be used later for soft contrastive weighting.
+        Build directed edges using asymmetric confidence.
         """
-        strength = {}
-
-        for (a, b), count in self.pair_support.items():
-            conf_ab = count / self.label_support[a]
-            conf_ba = count / self.label_support[b]
-            strength[(a, b)] = max(conf_ab, conf_ba)
-
-        return strength
-
-    def _build_groups(self, num_samples):
-        """
-        Core Apriori-style logic:
-        - Filter by minimum support
-        - Apply confidence threshold
-        - Build directional neighborhoods
-        """
-
         min_count = int(self.min_support * num_samples)
 
         for (a, b), count in self.pair_support.items():
@@ -179,19 +166,18 @@ class LabelStructureDiscovery:
             conf_ba = count / self.label_support[b]
 
             if conf_ab >= self.min_confidence:
-                self.groups[a].add(b)
+                self.graph[a][b] = conf_ab
 
             if conf_ba >= self.min_confidence:
-                self.groups[b].add(a)
+                self.graph[b][a] = conf_ba
 
-        self._prune_groups()
+    def _ensure_self_loops(self):
+        """
+        Ensure every label has at least a self-loop.
+        This guarantees every label participates in contrastive positives.
+        """
+        for label in self.label_support:
+            if label not in self.graph:
+                self.graph[label] = {}
 
-    def _prune_groups(self):
-        """
-        Prevents any single label from forming an overly large group.
-        This avoids collapsing representation space later.
-        """
-        for label in list(self.groups.keys()):
-            neighbors = list(self.groups[label])
-            if len(neighbors) > self.max_group_size:
-                self.groups[label] = set(neighbors[: self.max_group_size])
+            self.graph[label][label] = 1.0
