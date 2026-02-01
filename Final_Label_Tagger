@@ -368,3 +368,176 @@ def train_classifier(doc_embeddings, labels):
     clf.fit(X, y)
     return clf
 
+
+# Pipeline executors
+
+def run_phase1_preprocessing(train_df, test_df, text_col):
+    preprocessor = TextPreprocessor()
+
+    train_texts = train_df[text_col].tolist()
+    test_texts = test_df[text_col].tolist()
+
+    train_clean = preprocessor.fit_transform(train_texts)
+    test_clean = [preprocessor.transform(t) for t in test_texts]
+
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+
+    train_df["clean_text"] = train_clean
+    test_df["clean_text"] = test_clean
+
+    return train_df, test_df, preprocessor
+
+
+def run_phase3_label_graph(train_df, label_col):
+    label_sets = train_df[label_col].tolist()
+
+    graph_builder = LabelGraphDiscovery(
+        min_support=0.01,
+        min_confidence=0.05
+    )
+    graph_builder.fit(label_sets)
+
+    label_graph = graph_builder.get_graph()
+    return label_graph
+
+
+def build_window_dataset(df, vocab, window_generator, max_len, label_col):
+    all_windows = []
+    all_lengths = []
+    all_doc_ids = []
+    all_labels = []
+
+    for doc_id, row in enumerate(df.itertuples()):
+        tokens = row.clean_text.split()
+        windows = window_generator.generate(tokens)
+
+        for w in windows:
+            ids, length = vocab.encode(w, max_len)
+            all_windows.append(ids)
+            all_lengths.append(length)
+            all_doc_ids.append(doc_id)
+            all_labels.append(getattr(row, label_col))
+
+    return WindowDataset(
+        windows=np.array(all_windows),
+        lengths=np.array(all_lengths),
+        doc_ids=np.array(all_doc_ids),
+        labels=np.array(all_labels)
+    )
+
+def fit_vocabulary_from_train(train_df):
+    all_tokens = []
+    for text in train_df["clean_text"]:
+        all_tokens.extend(text.split())
+
+    vocab = Vocabulary(min_freq=2)
+    vocab.fit([all_tokens])
+    return vocab
+
+
+def run_phase4_contrastive_training(
+    train_dataset,
+    vocab,
+    label_graph,
+    device="cpu"
+):
+    encoder = train_contrastive(
+        dataset=train_dataset,
+        vocab_size=len(vocab.token_to_id),
+        label_graph=label_graph,
+        epochs=15,
+        batch_size=128,
+        lr=1e-3,
+        device=device
+    )
+    return encoder
+
+
+from sklearn.metrics import accuracy_score, f1_score
+
+def evaluate_pipeline(
+    encoder,
+    classifier,
+    test_df,
+    vocab,
+    label_col,
+    device="cpu"
+):
+    window_generator = WindowGenerator()
+    test_dataset = build_window_dataset(
+        test_df,
+        vocab,
+        window_generator,
+        max_len=25,
+        label_col=label_col
+    )
+
+    test_doc_embeddings = encode_and_aggregate(
+        encoder,
+        test_dataset,
+        device
+    )
+
+    y_true = []
+    y_pred = []
+
+    for doc_id, emb in test_doc_embeddings.items():
+        y_true.append(test_df.iloc[doc_id][label_col])
+        y_pred.append(classifier.predict(emb.unsqueeze(0).numpy())[0])
+
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "f1_macro": f1_score(y_true, y_pred, average="macro"),
+        "f1_micro": f1_score(y_true, y_pred, average="micro")
+    }
+
+def run_full_pipeline(splitter, text_col, label_col, device="cpu"):
+    train_df, test_df, _ = run_phase1_preprocessing(
+        splitter.train_df,
+        splitter.test_df,
+        text_col
+    )
+
+    label_graph = run_phase3_label_graph(train_df, label_col)
+
+    vocab = fit_vocabulary_from_train(train_df)
+
+    window_generator = WindowGenerator()
+    train_dataset = build_window_dataset(
+        train_df,
+        vocab,
+        window_generator,
+        max_len=25,
+        label_col=label_col
+    )
+
+    encoder = run_phase4_contrastive_training(
+        train_dataset,
+        vocab,
+        label_graph,
+        device
+    )
+
+    train_doc_embeddings = encode_and_aggregate(
+        encoder,
+        train_dataset,
+        device
+    )
+
+    classifier = run_phase5_classifier(
+        train_doc_embeddings,
+        train_df[label_col].tolist()
+    )
+
+    metrics = evaluate_pipeline(
+        encoder,
+        classifier,
+        test_df,
+        vocab,
+        label_col,
+        device
+    )
+
+    return encoder, classifier, metrics
+
