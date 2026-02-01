@@ -1,571 +1,272 @@
 import re
 import math
-from collections import Counter, defaultdict
-from typing import List
-from itertools import combinations
-
-
-class TextPreprocessor:
-
-    DATE_PATTERNS = [
-        r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b",
-        r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b",
-        r"\b\d{8}\b",
-        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
-        r"[a-z]*\s+\d{1,2}(?:,)?\s+\d{4}\b",
-        r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
-        r"[a-z]*\s+\d{4}\b",
-        r"\b\d{1,2}:\d{2}(?::\d{2})?\s?(?:am|pm)?\b",
-        r"\b\d{4}\s?[qQ]\d\b",
-    ]
-
-    def __init__(self, min_doc_freq: int = 3, entropy_threshold: float = 3.5):
-        self.min_doc_freq = min_doc_freq
-        self.entropy_threshold = entropy_threshold
-        self.doc_freq = Counter()
-        self.fitted = False
-
-    def fit(self, texts: List[str]):
-        for text in texts:
-            tokens = set(self._tokenize(text.lower()))
-            self.doc_freq.update(tokens)
-        self.fitted = True
-        return self
-
-    def transform(self, text: str) -> str:
-        if not self.fitted:
-            raise RuntimeError("fit() must be called before transform()")
-
-        text = text.lower()
-        text = self._normalize_dates(text)
-        tokens = self._tokenize(text)
-
-        output = []
-        for token in tokens:
-            if self._is_identifier(token):
-                output.append("<IDENTIFIER>")
-            else:
-                output.append(self._simple_lemmatize(token))
-
-        return " ".join(output)
-
-    def fit_transform(self, texts: List[str]) -> List[str]:
-        self.fit(texts)
-        return [self.transform(t) for t in texts]
-
-    def _normalize_dates(self, text: str) -> str:
-        for pattern in self.DATE_PATTERNS:
-            text = re.sub(pattern, "<DATE>", text)
-        return text
-
-    def _tokenize(self, text: str) -> List[str]:
-        return re.findall(r"[a-z0-9_<>]+", text)
-
-    def _is_identifier(self, token: str) -> bool:
-        if len(token) < 4:
-            return False
-        return (
-            self.doc_freq[token] < self.min_doc_freq
-            and self._entropy(token) > self.entropy_threshold
-        )
-
-    def _entropy(self, token: str) -> float:
-        freq = Counter(token)
-        length = len(token)
-        entropy = 0.0
-        for count in freq.values():
-            p = count / length
-            entropy -= p * math.log2(p)
-        return entropy
-
-    def _simple_lemmatize(self, token: str) -> str:
-        if token.endswith("ies") and len(token) > 4:
-            return token[:-3] + "y"
-        if token.endswith("ing") and len(token) > 5:
-            return token[:-3]
-        if token.endswith("ed") and len(token) > 4:
-            return token[:-2]
-        if token.endswith("s") and len(token) > 3:
-            return token[:-1]
-        return token
-
-from itertools import combinations
-from collections import Counter, defaultdict
-
-
-class LabelGraphDiscovery:
-    """
-    Phase 3: Label Graph Discovery
-
-    Builds a weighted, directed label graph where:
-    - nodes are labels
-    - edges represent co-occurrence strength
-    - weights encode confidence of association
-
-    This avoids hard grouping and supports overlapping semantics naturally.
-    """
-
-    def __init__(
-        self,
-        min_support=0.02,
-        min_confidence=0.05
-    ):
-        self.min_support = min_support
-        self.min_confidence = min_confidence
-
-        self.label_support = Counter()
-        self.pair_support = Counter()
-        self.graph = defaultdict(dict)
-
-        self.fitted = False
-
-    def fit(self, label_sets):
-        """
-        label_sets:
-        Iterable of label collections (list or set) per training sample.
-        TRAIN DATA ONLY.
-        """
-
-        num_samples = len(label_sets)
-
-        for labels in label_sets:
-            unique_labels = set(labels)
-
-            for label in unique_labels:
-                self.label_support[label] += 1
-
-            for a, b in combinations(sorted(unique_labels), 2):
-                self.pair_support[(a, b)] += 1
-
-        self._build_graph(num_samples)
-        self._ensure_self_loops()
-        self.fitted = True
-        return self
-
-    def get_graph(self):
-        if not self.fitted:
-            raise RuntimeError("fit() must be called before accessing graph")
-        return dict(self.graph)
-
-    def get_neighbors(self, label):
-        if not self.fitted:
-            raise RuntimeError("fit() must be called before querying graph")
-        return self.graph.get(label, {})
-
-    def _build_graph(self, num_samples):
-        """
-        Build directed edges using asymmetric confidence.
-        """
-        min_count = int(self.min_support * num_samples)
-
-        for (a, b), count in self.pair_support.items():
-            if count < min_count:
-                continue
-
-            conf_ab = count / self.label_support[a]
-            conf_ba = count / self.label_support[b]
-
-            if conf_ab >= self.min_confidence:
-                self.graph[a][b] = conf_ab
-
-            if conf_ba >= self.min_confidence:
-                self.graph[b][a] = conf_ba
-
-    def _ensure_self_loops(self):
-        """
-        Ensure every label has at least a self-loop.
-        This guarantees every label participates in contrastive positives.
-        """
-        for label in self.label_support:
-            if label not in self.graph:
-                self.graph[label] = {}
-
-            self.graph[label][label] = 1.0
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from collections import Counter, defaultdict
+from itertools import combinations
 from torch.utils.data import Dataset, DataLoader
-from collections import defaultdict
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import f1_score
+
+class TextPreprocessor:
+    DATE_PATTERNS = [
+        r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b",
+        r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b",
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}\s+\d{4}\b",
+    ]
+
+    def __init__(self, min_doc_freq=3, entropy_threshold=3.5):
+        self.min_doc_freq = min_doc_freq
+        self.entropy_threshold = entropy_threshold
+        self.doc_freq = Counter()
+
+    def fit(self, texts):
+        for t in texts:
+            self.doc_freq.update(set(self.tokenize(t.lower())))
+        return self
+
+    def transform(self, text):
+        text = text.lower()
+        for p in self.DATE_PATTERNS:
+            text = re.sub(p, "<DATE>", text)
+
+        tokens = self.tokenize(text)
+        out = []
+        for tok in tokens:
+            if self.is_identifier(tok):
+                out.append("<IDENTIFIER>")
+            else:
+                out.append(self.lemmatize(tok))
+        return out
+
+    def tokenize(self, text):
+        return re.findall(r"[a-z0-9_<>]+", text)
+
+    def is_identifier(self, tok):
+        if len(tok) < 4:
+            return False
+        return (
+            self.doc_freq[tok] < self.min_doc_freq
+            and self.entropy(tok) > self.entropy_threshold
+        )
+
+    def entropy(self, tok):
+        freq = Counter(tok)
+        ent = 0.0
+        for c in freq.values():
+            p = c / len(tok)
+            ent -= p * math.log2(p)
+        return ent
+
+    def lemmatize(self, tok):
+        for suf in ["ing", "ed", "ies", "s"]:
+            if tok.endswith(suf) and len(tok) > len(suf) + 2:
+                return tok[:-len(suf)]
+        return tok
+
+class LabelGraphDiscovery:
+    def __init__(self):
+        self.graph = defaultdict(dict)
+
+    def fit(self, label_sets):
+        support = Counter()
+        pairs = Counter()
+
+        for labels in label_sets:
+            labels = set(labels)
+            for l in labels:
+                support[l] += 1
+            for a, b in combinations(sorted(labels), 2):
+                pairs[(a, b)] += 1
+
+        for (a, b), cnt in pairs.items():
+            self.graph[a][b] = cnt / support[a]
+            self.graph[b][a] = cnt / support[b]
+
+        for l in support:
+            self.graph[l][l] = 1.0
+
+        return self
 
 class WindowGenerator:
-    def __init__(self, window_size=25, stride=10):
+    def __init__(self, window_size=20, stride=10):
         self.window_size = window_size
         self.stride = stride
 
     def generate(self, tokens):
-        windows = []
-        for start in range(0, len(tokens), self.stride):
-            window = tokens[start:start + self.window_size]
-            if len(window) > 0:
-                windows.append(window)
-        return windows
+        return [
+            tokens[i:i+self.window_size]
+            for i in range(0, len(tokens), self.stride)
+            if len(tokens[i:i+self.window_size]) > 0
+        ]
+
 
 class Vocabulary:
-    def __init__(self, min_freq=2):
-        self.min_freq = min_freq
-        self.token_to_id = {"<PAD>": 0, "<UNK>": 1}
-        self.id_to_token = {0: "<PAD>", 1: "<UNK>"}
+    def __init__(self):
+        self.t2i = {"<PAD>": 0, "<UNK>": 1}
 
-    def fit(self, documents):
-        freq = defaultdict(int)
-        for tokens in documents:
-            for t in tokens:
-                freq[t] += 1
-
-        for token, count in freq.items():
-            if count >= self.min_freq:
-                idx = len(self.token_to_id)
-                self.token_to_id[token] = idx
-                self.id_to_token[idx] = token
+    def fit(self, docs):
+        freq = Counter()
+        for d in docs:
+            freq.update(d)
+        for t in freq:
+            self.t2i[t] = len(self.t2i)
 
     def encode(self, tokens, max_len):
-        ids = [self.token_to_id.get(t, 1) for t in tokens[:max_len]]
+        ids = [self.t2i.get(t, 1) for t in tokens[:max_len]]
         length = len(ids)
         ids += [0] * (max_len - length)
         return ids, length
 
 
 class WindowDataset(Dataset):
-    def __init__(self, windows, lengths, doc_ids, labels):
-        self.windows = torch.tensor(windows, dtype=torch.long)
-        self.lengths = torch.tensor(lengths, dtype=torch.long)
-        self.doc_ids = torch.tensor(doc_ids, dtype=torch.long)
-        self.labels = labels
+    def __init__(self, windows, lengths, doc_ids, label_sets):
+        self.windows = torch.tensor(windows)
+        self.lengths = torch.tensor(lengths)
+        self.doc_ids = torch.tensor(doc_ids)
+        self.label_sets = label_sets
 
     def __len__(self):
         return len(self.windows)
 
     def __getitem__(self, idx):
-        return (
-            self.windows[idx],
-            self.lengths[idx],
-            self.doc_ids[idx],
-            self.labels[idx]
-        )
+        return self.windows[idx], self.lengths[idx], self.doc_ids[idx], self.label_sets[idx]
+
 
 class BiLSTMEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=64, hidden_dim=64, latent_dim=24):
+    def __init__(self, vocab_size, latent_dim=24):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(
-            embed_dim,
-            hidden_dim,
-            batch_first=True,
-            bidirectional=True
-        )
-        self.proj = nn.Linear(hidden_dim * 2, latent_dim)
+        self.emb = nn.Embedding(vocab_size, 64, padding_idx=0)
+        self.lstm = nn.LSTM(64, 64, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(128, latent_dim)
 
-    def forward(self, input_ids, lengths):
-        emb = self.embedding(input_ids)
+    def forward(self, ids, lengths):
+        x = self.emb(ids)
         packed = nn.utils.rnn.pack_padded_sequence(
-            emb, lengths.cpu(), batch_first=True, enforce_sorted=False
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
         _, (h, _) = self.lstm(packed)
-        h_cat = torch.cat([h[-2], h[-1]], dim=1)
-        return self.proj(h_cat)
+        h = torch.cat([h[-2], h[-1]], dim=1)
+        return self.fc(h)
 
-class WeightedSupConLoss(nn.Module):
-    def __init__(self, temperature=0.1):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, embeddings, doc_ids, labels, label_graph):
-        z = F.normalize(embeddings, dim=1)
-        sim = torch.matmul(z, z.T) / self.temperature
+class SupConLoss(nn.Module):
+    def forward(self, z, doc_ids, label_sets, label_graph):
+        z = F.normalize(z, dim=1)
+        sim = torch.matmul(z, z.T)
 
         loss = 0.0
-        count = 0
+        cnt = 0
 
         for i in range(len(z)):
-            weights = torch.zeros(len(z), device=z.device)
-
+            w = torch.zeros(len(z), device=z.device)
             for j in range(len(z)):
                 if i == j:
                     continue
-
                 if doc_ids[i] == doc_ids[j]:
-                    weights[j] = 1.0
-
-                elif labels[i] == labels[j]:
-                    weights[j] = 0.7
-
-                else:
-                    w = label_graph.get(labels[i], {}).get(labels[j], 0.0)
-                    if w > 0:
-                        weights[j] = 0.2 * w
-
-            if weights.sum() == 0:
+                    w[j] = 1.0
+                elif label_sets[i] & label_sets[j]:
+                    w[j] = 0.7
+            if w.sum() == 0:
                 continue
+            loss -= torch.log((torch.exp(sim[i]) * w).sum() / torch.exp(sim[i]).sum())
+            cnt += 1
 
-            numerator = torch.exp(sim[i]) * weights
-            denominator = torch.exp(sim[i]).sum()
-            loss -= torch.log(numerator.sum() / denominator)
-            count += 1
+        return loss / max(cnt, 1)
 
-        return loss / max(count, 1)
 
-def train_contrastive(
-    dataset,
-    vocab_size,
-    label_graph,
-    epochs=10,
-    batch_size=128,
-    lr=1e-3,
-    device="cpu"
-):
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model = BiLSTMEncoder(vocab_size).to(device)
-    criterion = WeightedSupConLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    model.train()
-    for epoch in range(epochs):
-        total = 0.0
-        for ids, lens, doc_ids, labels in loader:
-            ids = ids.to(device)
-            lens = lens.to(device)
-
-            z = model(ids, lens)
-            loss = criterion(z, doc_ids, labels, label_graph)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total += loss.item()
-
-        print(f"Epoch {epoch+1} | Loss {total:.4f}")
-
-    return model
-
-def aggregate_document_embeddings(window_embeddings, doc_ids):
+def aggregate_embeddings(z, doc_ids):
     doc_map = defaultdict(list)
+    for emb, d in zip(z, doc_ids):
+        doc_map[int(d)].append(emb)
 
-    for z, d in zip(window_embeddings, doc_ids):
-        doc_map[d].append(z)
-
-    doc_embeddings = {}
-    for d, vecs in doc_map.items():
-        vecs = torch.stack(vecs)
-        norms = torch.norm(vecs, dim=1)
-        topk = vecs[norms.topk(k=min(5, len(vecs))).indices]
-        doc_embeddings[d] = topk.mean(dim=0)
-
-    return doc_embeddings
-
-from sklearn.linear_model import LogisticRegression
-
-def train_classifier(doc_embeddings, labels):
-    X = []
-    y = []
-    for doc_id, emb in doc_embeddings.items():
-        X.append(emb.detach().cpu().numpy())
-        y.append(labels[doc_id])
-
-    clf = LogisticRegression(max_iter=500)
-    clf.fit(X, y)
-    return clf
+    return {d: torch.stack(v).mean(dim=0) for d, v in doc_map.items()}
 
 
-# Pipeline executors
+def train_classifier(doc_embs, label_map, train_ids, test_ids):
+    X_train, y_train = [], []
+    X_test, y_test = [], []
 
-def run_phase1_preprocessing(train_df, test_df, text_col):
-    preprocessor = TextPreprocessor()
+    for d in train_ids:
+        X_train.append(doc_embs[d].detach().cpu().numpy())
+        y_train.append(label_map[d])
 
-    train_texts = train_df[text_col].tolist()
-    test_texts = test_df[text_col].tolist()
+    for d in test_ids:
+        X_test.append(doc_embs[d].detach().cpu().numpy())
+        y_test.append(label_map[d])
 
-    train_clean = preprocessor.fit_transform(train_texts)
-    test_clean = [preprocessor.transform(t) for t in test_texts]
+    mlb = MultiLabelBinarizer()
+    Y_train = mlb.fit_transform(y_train)
+    Y_test = mlb.transform(y_test)
 
-    train_df = train_df.copy()
-    test_df = test_df.copy()
+    clf = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", OneVsRestClassifier(LogisticRegression(max_iter=2000)))
+    ])
 
-    train_df["clean_text"] = train_clean
-    test_df["clean_text"] = test_clean
+    clf.fit(X_train, Y_train)
+    preds = clf.predict(X_test)
 
-    return train_df, test_df, preprocessor
+    print("Test micro-F1:", f1_score(Y_test, preds, average="micro"))
 
+def main(df):
+    texts = df["description"].fillna("").tolist()
+    labels = [
+        {l.strip() for l in s.split(",") if l.strip()}
+        for s in df["labels"]
+    ]
 
-def run_phase3_label_graph(train_df, label_col):
-    label_sets = train_df[label_col].tolist()
-
-    graph_builder = LabelGraphDiscovery(
-        min_support=0.01,
-        min_confidence=0.05
-    )
-    graph_builder.fit(label_sets)
-
-    label_graph = graph_builder.get_graph()
-    return label_graph
-
-
-def build_window_dataset(df, vocab, window_generator, max_len, label_col):
-    all_windows = []
-    all_lengths = []
-    all_doc_ids = []
-    all_labels = []
-
-    for doc_id, row in enumerate(df.itertuples()):
-        tokens = row.clean_text.split()
-        windows = window_generator.generate(tokens)
-
-        for w in windows:
-            ids, length = vocab.encode(w, max_len)
-            all_windows.append(ids)
-            all_lengths.append(length)
-            all_doc_ids.append(doc_id)
-            all_labels.append(getattr(row, label_col))
-
-    return WindowDataset(
-        windows=np.array(all_windows),
-        lengths=np.array(all_lengths),
-        doc_ids=np.array(all_doc_ids),
-        labels=np.array(all_labels)
+    train_idx, test_idx = train_test_split(
+        list(range(len(texts))), test_size=0.2, random_state=42
     )
 
-def fit_vocabulary_from_train(train_df):
-    all_tokens = []
-    for text in train_df["clean_text"]:
-        all_tokens.extend(text.split())
+    pre = TextPreprocessor().fit([texts[i] for i in train_idx])
+    tokens = [pre.transform(t) for t in texts]
 
-    vocab = Vocabulary(min_freq=2)
-    vocab.fit([all_tokens])
-    return vocab
+    label_graph = LabelGraphDiscovery().fit([labels[i] for i in train_idx])
 
+    wg = WindowGenerator()
+    windows, lengths, doc_ids, win_labels = [], [], [], []
 
-def run_phase4_contrastive_training(
-    train_dataset,
-    vocab,
-    label_graph,
-    device="cpu"
-):
-    encoder = train_contrastive(
-        dataset=train_dataset,
-        vocab_size=len(vocab.token_to_id),
-        label_graph=label_graph,
-        epochs=15,
-        batch_size=128,
-        lr=1e-3,
-        device=device
-    )
-    return encoder
+    for i, toks in enumerate(tokens):
+        for w in wg.generate(toks):
+            windows.append(w)
+            doc_ids.append(i)
+            win_labels.append(labels[i])
 
+    vocab = Vocabulary()
+    vocab.fit(windows)
 
-from sklearn.metrics import accuracy_score, f1_score
+    enc_w, enc_l = [], []
+    for w in windows:
+        ids, l = vocab.encode(w, 20)
+        enc_w.append(ids)
+        enc_l.append(l)
 
-def evaluate_pipeline(
-    encoder,
-    classifier,
-    test_df,
-    vocab,
-    label_col,
-    device="cpu"
-):
-    window_generator = WindowGenerator()
-    test_dataset = build_window_dataset(
-        test_df,
-        vocab,
-        window_generator,
-        max_len=25,
-        label_col=label_col
-    )
+    ds = WindowDataset(enc_w, enc_l, doc_ids, win_labels)
+    loader = DataLoader(ds, batch_size=128, shuffle=True)
 
-    test_doc_embeddings = encode_and_aggregate(
-        encoder,
-        test_dataset,
-        device
-    )
+    model = BiLSTMEncoder(len(vocab.t2i))
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = SupConLoss()
 
-    y_true = []
-    y_pred = []
+    for _ in range(5):
+        for ids, lens, d_ids, lbls in loader:
+            z = model(ids, lens)
+            loss = loss_fn(z, d_ids, lbls, label_graph.graph)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
 
-    for doc_id, emb in test_doc_embeddings.items():
-        y_true.append(test_df.iloc[doc_id][label_col])
-        y_pred.append(classifier.predict(emb.unsqueeze(0).numpy())[0])
+    all_z = model(torch.tensor(enc_w), torch.tensor(enc_l))
+    doc_embs = aggregate_embeddings(all_z, doc_ids)
 
-    return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "f1_macro": f1_score(y_true, y_pred, average="macro"),
-        "f1_micro": f1_score(y_true, y_pred, average="micro")
-    }
-
-
-def encode_and_aggregate(encoder, dataset, device="cpu"):
-    loader = DataLoader(dataset, batch_size=256, shuffle=False)
-    encoder.eval()
-
-    window_embeddings = []
-    doc_ids = []
-
-    with torch.no_grad():
-        for ids, lens, d_ids, _ in loader:
-            ids = ids.to(device)
-            lens = lens.to(device)
-
-            z = encoder(ids, lens)
-            window_embeddings.extend(z.cpu())
-            doc_ids.extend(d_ids.numpy())
-
-    return aggregate_document_embeddings(window_embeddings, doc_ids)
-
-
-def run_phase5_classifier(train_doc_embeddings, train_labels):
-    classifier = train_classifier(
-        train_doc_embeddings,
-        train_labels
-    )
-    return classifier
-
-
-def run_full_pipeline(splitter, text_col, label_col, device="cpu"):
-    train_df, test_df, _ = run_phase1_preprocessing(
-        splitter.train_df,
-        splitter.test_df,
-        text_col
-    )
-
-    label_graph = run_phase3_label_graph(train_df, label_col)
-
-    vocab = fit_vocabulary_from_train(train_df)
-
-    window_generator = WindowGenerator()
-    train_dataset = build_window_dataset(
-        train_df,
-        vocab,
-        window_generator,
-        max_len=25,
-        label_col=label_col
-    )
-
-    encoder = run_phase4_contrastive_training(
-        train_dataset,
-        vocab,
-        label_graph,
-        device
-    )
-
-    train_doc_embeddings = encode_and_aggregate(
-        encoder,
-        train_dataset,
-        device
-    )
-
-    classifier = run_phase5_classifier(
-        train_doc_embeddings,
-        train_df[label_col].tolist()
-    )
-
-    metrics = evaluate_pipeline(
-        encoder,
-        classifier,
-        test_df,
-        vocab,
-        label_col,
-        device
-    )
-
-    return encoder, classifier, metrics
+    train_classifier(doc_embs, dict(enumerate(labels)), train_idx, test_idx)
 
