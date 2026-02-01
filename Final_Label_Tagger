@@ -492,6 +492,34 @@ def evaluate_pipeline(
         "f1_micro": f1_score(y_true, y_pred, average="micro")
     }
 
+
+def encode_and_aggregate(encoder, dataset, device="cpu"):
+    loader = DataLoader(dataset, batch_size=256, shuffle=False)
+    encoder.eval()
+
+    window_embeddings = []
+    doc_ids = []
+
+    with torch.no_grad():
+        for ids, lens, d_ids, _ in loader:
+            ids = ids.to(device)
+            lens = lens.to(device)
+
+            z = encoder(ids, lens)
+            window_embeddings.extend(z.cpu())
+            doc_ids.extend(d_ids.numpy())
+
+    return aggregate_document_embeddings(window_embeddings, doc_ids)
+
+
+def run_phase5_classifier(train_doc_embeddings, train_labels):
+    classifier = train_classifier(
+        train_doc_embeddings,
+        train_labels
+    )
+    return classifier
+
+
 def run_full_pipeline(splitter, text_col, label_col, device="cpu"):
     train_df, test_df, _ = run_phase1_preprocessing(
         splitter.train_df,
