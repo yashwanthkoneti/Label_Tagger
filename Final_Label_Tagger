@@ -270,3 +270,100 @@ def main(df):
 
     train_classifier(doc_embs, dict(enumerate(labels)), train_idx, test_idx)
 
+
+
+def predict_single_use_case(
+    raw_text,
+    text_preprocessor,
+    window_generator,
+    vocabulary,
+    encoder,
+    classifier,
+    mlb,
+    window_size=20,
+    threshold=0.3,
+    device="cpu"
+):
+    """
+    Predict labels for a single raw text input
+    """
+
+    # -----------------------------
+    # Phase 1: Preprocess
+    # -----------------------------
+    tokens = text_preprocessor.transform(raw_text)
+
+    if len(tokens) == 0:
+        return {
+            "input_text": raw_text,
+            "predictions": {},
+            "note": "Empty text after preprocessing"
+        }
+
+    # -----------------------------
+    # Phase 2: Windowing
+    # -----------------------------
+    windows = window_generator.generate(tokens)
+
+    if len(windows) == 0:
+        return {
+            "input_text": raw_text,
+            "predictions": {},
+            "note": "No windows generated"
+        }
+
+    # -----------------------------
+    # Encode windows
+    # -----------------------------
+    encoded_ids = []
+    lengths = []
+
+    for w in windows:
+        ids, l = vocabulary.encode(w, window_size)
+        encoded_ids.append(ids)
+        lengths.append(l)
+
+    input_ids = torch.tensor(encoded_ids, dtype=torch.long).to(device)
+    lengths = torch.tensor(lengths, dtype=torch.long).to(device)
+
+    # -----------------------------
+    # Phase 4: Encode embeddings
+    # -----------------------------
+    encoder.eval()
+    with torch.no_grad():
+        window_embeddings = encoder(input_ids, lengths)
+
+    # -----------------------------
+    # Phase 5: Aggregate windows
+    # -----------------------------
+    norms = torch.norm(window_embeddings, dim=1)
+    top_k = min(5, len(window_embeddings))
+    top_embeddings = window_embeddings[norms.topk(top_k).indices]
+    doc_embedding = top_embeddings.mean(dim=0).unsqueeze(0)
+
+    # -----------------------------
+    # Phase 5: Predict probabilities
+    # -----------------------------
+    probs = classifier.predict_proba(doc_embedding.cpu().numpy())[0]
+    label_names = mlb.classes_
+
+    label_probs = dict(zip(label_names, probs))
+
+    # -----------------------------
+    # Thresholding
+    # -----------------------------
+    selected = {
+        lbl: float(p)
+        for lbl, p in label_probs.items()
+        if p >= threshold
+    }
+
+    # Ensure at least one label
+    if not selected:
+        best_label = max(label_probs, key=label_probs.get)
+        selected = {best_label: float(label_probs[best_label])}
+
+    return {
+        "input_text": raw_text,
+        "predictions": selected
+    }
