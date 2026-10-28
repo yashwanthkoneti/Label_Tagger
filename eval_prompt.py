@@ -15,12 +15,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("RAG_AUDIT_PIPELINE")
 
 # ==========================================
-# 1. CONFIGURATION & CLIENT SETUP
+# 1. CONFIGURATION & FILE PATHS
 # ==========================================
 SERVING_ENDPOINT_NAME = os.getenv("SERVING_ENDPOINT_NAME", "databricks-dbrx-instruct")
 MAX_CONCURRENCY = 10  # Semaphore limit for async workers
 MAX_HISTORY_TURNS = 5
-CHECKPOINT_PATH = "/dbfs/tmp/rag_audit_checkpoints/audit_results_checkpoint.json"
+
+# Stable CSV Path Configuration
+INPUT_CSV = os.getenv("INPUT_CSV", "/dbfs/tmp/rag_audit_input/transactions.csv")
+OUTPUT_CSV = os.getenv("OUTPUT_CSV", "/dbfs/tmp/rag_audit_checkpoints/audit_results.csv")
 
 w = WorkspaceClient()
 
@@ -235,15 +238,26 @@ async def evaluate_single_transaction(
                 "step1_standalone_intent": None,
                 "step2_constraint_audit": None,
                 "step3_retrieval_grounding_audit": None,
+                **{k: None for k in AuditMatrix().dict().keys()},
                 "audit_status": "FAILED",
                 "error_message": str(e)
             }
 
 
 # ==========================================
-# 6. PIPELINE ORCHESTRATOR & CHECKPOINTING
+# 6. PIPELINE ORCHESTRATOR & CSV CHECKPOINTING
 # ==========================================
-async def run_batch_audit_pipeline(df_transactions: pd.DataFrame, history_lookup: Dict[str, List[Dict[str, str]]]):
+async def run_batch_audit_pipeline(
+    input_csv_path: str = INPUT_CSV, 
+    output_csv_path: str = OUTPUT_CSV, 
+    history_lookup: Optional[Dict[str, List[Dict[str, str]]]] = None
+):
+    if history_lookup is None:
+        history_lookup = {}
+        
+    logger.info(f"Loading transactions from {input_csv_path}...")
+    df_transactions = pd.read_csv(input_csv_path)
+    
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     tasks = [evaluate_single_transaction(row, semaphore, history_lookup) for _, row in df_transactions.iterrows()]
     
@@ -252,9 +266,9 @@ async def run_batch_audit_pipeline(df_transactions: pd.DataFrame, history_lookup
     
     df_results = pd.DataFrame(results)
     
-    # Save checkpoint results
-    os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
-    df_results.to_json(CHECKPOINT_PATH, orient="records", indent=2)
-    logger.info(f"Pipeline complete. Successfully checkpointed {len(df_results)} rows to {CHECKPOINT_PATH}")
+    # Save results to OUTPUT_CSV
+    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+    df_results.to_csv(output_csv_path, index=False)
+    logger.info(f"Pipeline complete. Successfully saved {len(df_results)} rows to {output_csv_path}")
     
     return df_results
