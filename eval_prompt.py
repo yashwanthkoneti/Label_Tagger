@@ -16,7 +16,7 @@ logger = logging.getLogger("RAG_Matrix_Auditor")
 # ==========================================
 # CONFIGURATION & HYPERPARAMETERS
 # ==========================================
-SERVING_ENDPOINT_NAME = "databricks-dbrx-instruct"  # Replace with your endpoint
+SERVING_ENDPOINT_NAME = "databricks-dbrx-instruct"  # Replace with your endpoint / model name
 MAX_CONCURRENT_CALLS = 10
 MAX_HISTORY_TURNS = 5
 CHECKPOINT_DIR = Path("./audit_checkpoints")
@@ -33,7 +33,8 @@ ALLOWED_THEMES = {
     "EXCESSIVE_GUARDRAIL",
     "INCOMPLETE_SAFE_ALTERNATIVE",
     "QUALITY_OF_COMMUNICATION",
-    "NONE"
+    "EXPECTED_BEHAVIOR",
+    "UNMAPPED"
 }
 
 # ==========================================
@@ -44,19 +45,19 @@ class AuditMatrix(BaseModel):
         default=False, description="TRUE if request lacks info required to determine policy/scenario/entity, making clarification appropriate."
     )
     unnecessary_clarification: bool = Field(
-        default=False, description="TRUE if enough info exists, but assistant unnecessarily asks additional questions or creates loops."
+        default=False, description="TRUE if enough info exists or a conditional answer could have been provided before asking questions."
     )
     retrieval_coverage_gap: bool = Field(
-        default=False, description="TRUE if the required authoritative document, clause, legal text, or evidence was not retrieved at all."
+        default=False, description="TRUE if the required authoritative document, clause, legal text, or evidence simply wasn't retrieved at all."
     )
     retrieval_precision_issue: bool = Field(
         default=False, description="TRUE if info was retrieved, but evidence used is tangential, from wrong context, or less applicable."
     )
     context_continuity_failure: bool = Field(
-        default=False, description="TRUE if relevant info/constraints established earlier in conversation are ignored or re-requested."
+        default=False, description="TRUE if relevant info/constraints established earlier in conversation are ignored, forgotten, or re-requested."
     )
     intent_misinterpretation: bool = Field(
-        default=False, description="TRUE if assistant misunderstands what user is trying to accomplish (lookup vs summary vs explanation)."
+        default=False, description="TRUE if assistant misunderstands what user is trying to accomplish (lookup vs summary vs explanation or wrong decision trigger)."
     )
     excessive_guardrail: bool = Field(
         default=False, description="TRUE if a legitimate request is unnecessarily blocked because safety/policy boundaries are interpreted too broadly."
@@ -76,16 +77,16 @@ class AuditMatrix(BaseModel):
 
 class AuditEvaluationResponse(BaseModel):
     step1_standalone_intent: str = Field(
-        default="", description="Step 1 analysis capturing request alongside conversation history up to 5 turns."
+        default="", description="Step 1 analysis capturing request alongside chronological conversation history up to 5 turns."
     )
     step2_context_constraint_audit: str = Field(
-        default="", description="Step 2 analysis evaluating past constraints, role boundaries, and conversation continuity."
+        default="", description="Step 2 analysis evaluating past constraints, context amnesia, role boundaries, and conversation continuity."
     )
     step3_retrieval_grounding_audit: str = Field(
-        default="", description="Step 3 holistic analysis comparing response against document chunks."
+        default="", description="Step 3 holistic analysis comparing response against retrieved document chunks and identifying root causes."
     )
     primary_failure_theme: str = Field(
-        default="NONE", description="The single most accurate root-cause theme selected by the LLM from the allowed list."
+        default="UNMAPPED", description="The single most accurate primary root-cause theme selected by the LLM from the allowed list."
     )
     matrix: AuditMatrix = Field(default_factory=AuditMatrix)
 
@@ -98,37 +99,45 @@ class AuditEvaluationResponse(BaseModel):
     @field_validator("primary_failure_theme", mode="before")
     def coerce_theme(cls, v):
         theme = str(v).strip().upper()
-        return theme if theme in ALLOWED_THEMES else "NONE"
+        return theme if theme in ALLOWED_THEMES else "UNMAPPED"
 
 # ==========================================
 # SYSTEM PROMPT (LLM ROOT-CAUSE SELECTION)
 # ==========================================
 AUDITOR_SYSTEM_PROMPT = """You are an expert external AI Auditor evaluating enterprise RAG conversations.
-Follow this explicit 3-step holistic evaluation process before assigning flags and selecting the primary failure theme:
+Follow this explicit 3-step holistic evaluation process before assigning multi-label flags and selecting the single primary failure theme.
+
+CRITICAL DISAMBIGUATION RULES FOR ROOT CAUSES:
+1. **Over-Guardrailing vs Retrieval Dead End**: If an assistant gives a generic refusal because no useful evidence was retrieved, determine if the root cause was a **RETRIEVAL_COVERAGE_GAP** (missing evidence) rather than **EXCESSIVE_GUARDRAIL**. Do not mislabel empty retrieval as a policy block.
+2. **Over-Guardrailing vs Intent Misinterpretation**: If the assistant refuses because it incorrectly assumes the user is asking for a definitive decision/action it cannot take, classify the primary root cause as **INTENT_MISINTERPRETATION**.
+3. **Retrieval Coverage vs Precision**: Distinguish clearly between required evidence not being retrieved at all (**RETRIEVAL_COVERAGE_GAP**) vs. evidence being retrieved but being tangential or from the wrong segment (**RETRIEVAL_PRECISION_ISSUE**).
+4. **Clarification Audit**: Do not mark clarification requests as uniformly valid. Test whether a useful conditional answer could have been provided before asking follow-up questions. If unnecessary, flag **UNNECESSARY_CLARIFICATION**.
+5. **Context Continuity / Amnesia**: Pay close attention to multi-turn memory. If constraints established earlier in the conversation are ignored or re-requested, flag **CONTEXT_CONTINUITY_FAILURE**.
 
 STEP 1: STANDALONE INTENT EXTRACTION
-- Analyze the user request alongside conversation history (up to 5 turns).
+- Analyze the immediate user request alongside past conversation history up to 5 turns (strictly evaluated without future peeking).
 - State the explicit intent and goal of the user request.
 
 STEP 2: CONTEXT & CONSTRAINT AUDIT
-- Check if previous conversation constraints or established facts were respected.
-- Determine if clarification is genuinely required or if the assistant created unnecessary loops.
+- Check if previous conversation constraints or established facts were respected, or if context amnesia occurred.
+- Evaluate whether clarification was genuinely required or if the assistant created unnecessary loops.
 
 STEP 3: HOLISTIC RETRIEVAL & GROUNDING CHECK
-- Evaluate the response against the provided document chunks as a whole.
-- Assess whether retrieval had coverage gaps, precision issues, or if the response suffered from quality/guardrail failures.
+- Evaluate the response against the provided document chunks.
+- Separate primary root-cause failure from secondary compounding issues.
 
-THEME DEFINITIONS TO CHOOSE FROM:
+ALLOWED THEMES TO CHOOSE FROM FOR primary_failure_theme:
 1. INSUFFICIENT_USER_CONTEXT: Request lacks info required to determine policy/scenario/entity/product/role. Clarification appropriate.
-2. UNNECESSARY_CLARIFICATION: Enough info already exists, but assistant asks additional questions or creates excessive loops.
+2. UNNECESSARY_CLARIFICATION: Enough info already exists or conditional answer was possible, but assistant asks additional questions or creates loops.
 3. RETRIEVAL_COVERAGE_GAP: Required authoritative document, clause, appendix, legal text, or evidence simply wasn't retrieved.
 4. RETRIEVAL_PRECISION_ISSUE: Information retrieved, but evidence used is tangential, from wrong segment/context, or less applicable.
-5. CONTEXT_CONTINUITY_FAILURE: Relevant info already established earlier in conversation is ignored, forgotten, or unnecessarily re-requested.
-6. INTENT_MISINTERPRETATION: Assistant misunderstands what user is trying to accomplish (navigation, summarization, lookup, explanation).
+5. CONTEXT_CONTINUITY_FAILURE: Relevant info already established earlier in conversation is ignored, forgotten (context amnesia), or unnecessarily re-requested.
+6. INTENT_MISINTERPRETATION: Assistant misunderstands what user is trying to accomplish (navigation, summarization, lookup, explanation, or wrong decision trigger).
 7. EXCESSIVE_GUARDRAIL: Legitimate request unnecessarily blocked/restricted because safety/policy boundaries are interpreted too broadly.
 8. INCOMPLETE_SAFE_ALTERNATIVE: Correctly identifies limit, but fails to provide permissible assistance like criteria, repository guidance, or next steps.
 9. QUALITY_OF_COMMUNICATION: Answer substantively available but poorly delivered (incomplete, overly verbose, vague, repetitive, badly structured).
-10. NONE: No failure detected (fully successful turn).
+10. EXPECTED_BEHAVIOR: No failure detected; fully successful and appropriate turn.
+11. UNMAPPED: Anomalous behavior or failure mode that does not fall into any of the above categories, or when an issue occurs but cannot be categorized under existing themes.
 
 OUTPUT REQUIREMENTS:
 Output strictly a valid JSON object matching this schema:
@@ -197,7 +206,7 @@ async def evaluate_single_transaction(
         conv_id = str(row['conversation_id'])
         trans_id = str(row['transaction_id'])
         
-        # Retrieve history strictly accumulated UP TO this transaction
+        # Retrieve history strictly accumulated UP TO this transaction (no future peek)
         full_history = history_lookup.get(trans_id, [])
         bounded_history = full_history[-MAX_HISTORY_TURNS:] if len(full_history) > MAX_HISTORY_TURNS else full_history
         
