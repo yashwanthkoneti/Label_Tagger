@@ -16,68 +16,56 @@ logger = logging.getLogger("RAG_Matrix_Auditor")
 # ==========================================
 # CONFIGURATION & HYPERPARAMETERS
 # ==========================================
-SERVING_ENDPOINT_NAME = "databricks-dbrx-instruct"  # Replace with your Databricks Serving Endpoint
-MAX_CONCURRENT_CALLS = 10                          # Concurrency limit for parallel requests
-MAX_HISTORY_TURNS = 5                              # 5-turn sliding window threshold
+SERVING_ENDPOINT_NAME = "databricks-dbrx-instruct"  # Replace with your endpoint
+MAX_CONCURRENT_CALLS = 10
+MAX_HISTORY_TURNS = 5
 CHECKPOINT_DIR = Path("./audit_checkpoints")
 INPUT_CSV_PATH = "rag_transcripts.csv"
 OUTPUT_MASTER_CSV = "master_rag_audit_results.csv"
 
-# Deterministic Theme Weights (Resolves overlapping indicators safely without LLM logic order errors)
-THEME_WEIGHTS = {
-    "MATERIAL_RISK_FAILURE": 120,      # Could cause materially wrong action (Priority 1)
-    "ROLE_BREACH": 110,                # Agent broke role/persona constraints (Priority 2)
-    "OVER_GUARDRAILING": 100,          # Safety/Policy false positive (Priority 3)
-    "RETRIEVAL_DEAD_END": 80,          # Vector/Retrieval pipeline failure (Priority 4)
-    "RETRIEVAL_PRECISION_ISSUE": 75,   # Retrieval noise or precision failure (Priority 5)
-    "CLARIFICATION_FATIGUE": 60,       # Conversational UX loop bug (Priority 6)
-    "VERSION_CONTROL_FAILURE": 50,     # Outdated document/version used (Priority 7)
-    "INTENT_MISCLASSIFICATION": 45,    # Query interpretation error (Priority 8)
-    "CONTEXT_AMNESIA": 40,             # State management/Memory loss (Priority 9)
-    "CLARIFICATION_REQUESTED": 30,     # Valid conversational askback (Priority 10)
-    "VERBOSITY_FATIGUE": 20,           # Formatting/Style issue (Priority 11)
-    "UNMAPPED_FAILURE": 10,            # Edge-case failure (Priority 12)
+ALLOWED_THEMES = {
+    "INSUFFICIENT_USER_CONTEXT",
+    "UNNECESSARY_CLARIFICATION",
+    "RETRIEVAL_COVERAGE_GAP",
+    "RETRIEVAL_PRECISION_ISSUE",
+    "CONTEXT_CONTINUITY_FAILURE",
+    "INTENT_MISINTERPRETATION",
+    "EXCESSIVE_GUARDRAIL",
+    "INCOMPLETE_SAFE_ALTERNATIVE",
+    "QUALITY_OF_COMMUNICATION",
+    "NONE"
 }
 
 # ==========================================
-# ROBUST PYDANTIC SCHEMAS (ERROR-PROOF)
+# ROBUST PYDANTIC SCHEMAS
 # ==========================================
 class AuditMatrix(BaseModel):
-    has_role_breach: bool = Field(
-        default=False, description="TRUE if the chat agent broke its role or persona boundaries."
+    insufficient_user_context: bool = Field(
+        default=False, description="TRUE if request lacks info required to determine policy/scenario/entity, making clarification appropriate."
     )
-    has_material_risk: bool = Field(
-        default=False, description="TRUE if the response could cause a materially wrong or dangerous action."
+    unnecessary_clarification: bool = Field(
+        default=False, description="TRUE if enough info exists, but assistant unnecessarily asks additional questions or creates loops."
     )
-    has_retrieval_precision_issue: bool = Field(
-        default=False, description="TRUE if retrieved chunks contained noise or lacked search precision."
+    retrieval_coverage_gap: bool = Field(
+        default=False, description="TRUE if the required authoritative document, clause, legal text, or evidence was not retrieved at all."
     )
-    has_intent_misclassification: bool = Field(
-        default=False, description="TRUE if the query intent was misunderstood."
+    retrieval_precision_issue: bool = Field(
+        default=False, description="TRUE if info was retrieved, but evidence used is tangential, from wrong context, or less applicable."
     )
-    has_version_control_failure: bool = Field(
-        default=False, description="TRUE if outdated versions or deprecated documents were used."
+    context_continuity_failure: bool = Field(
+        default=False, description="TRUE if relevant info/constraints established earlier in conversation are ignored or re-requested."
     )
-    is_over_guardrailed: bool = Field(
-        default=False, description="TRUE if user request was safe, but the agent output a compliance/refusal block."
+    intent_misinterpretation: bool = Field(
+        default=False, description="TRUE if assistant misunderstands what user is trying to accomplish (lookup vs summary vs explanation)."
     )
-    has_retrieval_dead_end: bool = Field(
-        default=False, description="TRUE if Step 3 shows required information was missing/empty in document_chunks."
+    excessive_guardrail: bool = Field(
+        default=False, description="TRUE if a legitimate request is unnecessarily blocked because safety/policy boundaries are interpreted too broadly."
     )
-    has_clarification_fatigue: bool = Field(
-        default=False, description="TRUE if the user already answered a clarification previously, but agent asked again."
+    incomplete_safe_alternative: bool = Field(
+        default=False, description="TRUE if assistant identifies a limitation, but fails to provide permissible next steps, escalation, or repository guidance."
     )
-    has_context_amnesia: bool = Field(
-        default=False, description="TRUE if Step 2 shows the agent ignored explicit constraints set in earlier history turns."
-    )
-    has_verbosity_fatigue: bool = Field(
-        default=False, description="TRUE if response is accurate but contains >50% redundant corporate fluff."
-    )
-    is_valid_askback: bool = Field(
-        default=False, description="TRUE if Step 2 shows the agent asked a helpful clarifying question."
-    )
-    is_unmapped_failure: bool = Field(
-        default=False, description="TRUE if failure does not fit other categories."
+    quality_of_communication: bool = Field(
+        default=False, description="TRUE if answer is substantively correct but poorly delivered (verbose, vague, repetitive, badly structured)."
     )
 
     @field_validator("*", mode="before")
@@ -90,129 +78,79 @@ class AuditEvaluationResponse(BaseModel):
     step1_standalone_intent: str = Field(
         default="", description="Step 1 analysis capturing request alongside conversation history up to 5 turns."
     )
-    step2_constraint_audit: str = Field(
-        default="", description="Step 2 analysis listing explicit past constraints and role compliance."
+    step2_context_constraint_audit: str = Field(
+        default="", description="Step 2 analysis evaluating past constraints, role boundaries, and conversation continuity."
     )
     step3_retrieval_grounding_audit: str = Field(
-        default="", description="Step 3 analysis comparing response to document_chunks and sources."
+        default="", description="Step 3 holistic analysis comparing response against document chunks."
     )
-    completeness_score: Union[int, str] = Field(
-        default=0, description="Completeness score on 0-3 scale or string 'self-abstained'."
+    primary_failure_theme: str = Field(
+        default="NONE", description="The single most accurate root-cause theme selected by the LLM from the allowed list."
     )
     matrix: AuditMatrix = Field(default_factory=AuditMatrix)
-    relevancy_score: float = Field(
-        default=0.0, ge=0.0, le=1.0, description="0.0 to 1.0 relevancy score."
-    )
-    grounding_score: float = Field(
-        default=0.0, ge=0.0, le=1.0, description="0.0 to 1.0 grounding score against document_chunks."
-    )
 
-    @field_validator("step1_standalone_intent", "step2_constraint_audit", "step3_retrieval_grounding_audit", mode="before")
+    @field_validator("step1_standalone_intent", "step2_context_constraint_audit", "step3_retrieval_grounding_audit", mode="before")
     def coerce_to_string(cls, v):
         if isinstance(v, (dict, list)):
             return json.dumps(v)
         return str(v) if v is not None else ""
 
-    @field_validator("completeness_score", mode="before")
-    def coerce_completeness(cls, v):
-        if str(v).lower() in ["self-abstained", "abstained", "none", "null"]:
-            return "self-abstained"
-        try:
-            return int(v)
-        except (ValueError, TypeError):
-            return 0
-
-    @field_validator("relevancy_score", "grounding_score", mode="before")
-    def coerce_scores(cls, v):
-        try:
-            return float(v)
-        except (ValueError, TypeError):
-            return 0.0
+    @field_validator("primary_failure_theme", mode="before")
+    def coerce_theme(cls, v):
+        theme = str(v).strip().upper()
+        return theme if theme in ALLOWED_THEMES else "NONE"
 
 # ==========================================
-# SYSTEM PROMPT (UPDATED WITH ALL THEMES)
+# SYSTEM PROMPT (LLM ROOT-CAUSE SELECTION)
 # ==========================================
-AUDITOR_SYSTEM_PROMPT = """You are an expert external AI Auditor evaluating an enterprise RAG conversation.
-To prevent arbitrary scoring, you MUST follow this explicit 3-step evaluation process before assigning scores and matrix flags:
+AUDITOR_SYSTEM_PROMPT = """You are an expert external AI Auditor evaluating enterprise RAG conversations.
+Follow this explicit 3-step holistic evaluation process before assigning flags and selecting the primary failure theme:
 
 STEP 1: STANDALONE INTENT EXTRACTION
-- Analyze the user request alongside the conversation history (up to 5 turns).
-- State the explicit standalone intent of the user request, including any implied constraints, entities, or preferences.
+- Analyze the user request alongside conversation history (up to 5 turns).
+- State the explicit intent and goal of the user request.
 
-STEP 2: CONSTRAINT & FACT CHECKING
-- List any explicit constraints set by the user in previous turns.
-- Did the current response respect all history constraints and remain within role boundaries? (YES/NO + explain)
-- Did the agent ask a question back to clarify the prompt? (YES/NO)
+STEP 2: CONTEXT & CONSTRAINT AUDIT
+- Check if previous conversation constraints or established facts were respected.
+- Determine if clarification is genuinely required or if the assistant created unnecessary loops.
 
-STEP 3: RETRIEVAL GROUNDING CHECK
-- Compare the response against the provided document_chunks and source quality.
-- Identify retrieval precision issues, version control failures, or missing information.
-- Identify if the response contains claims not supported by the document_chunks (hallucinations/fabrications).
+STEP 3: HOLISTIC RETRIEVAL & GROUNDING CHECK
+- Evaluate the response against the provided document chunks as a whole.
+- Assess whether retrieval had coverage gaps, precision issues, or if the response suffered from quality/guardrail failures.
+
+THEME DEFINITIONS TO CHOOSE FROM:
+1. INSUFFICIENT_USER_CONTEXT: Request lacks info required to determine policy/scenario/entity/product/role. Clarification appropriate.
+2. UNNECESSARY_CLARIFICATION: Enough info already exists, but assistant asks additional questions or creates excessive loops.
+3. RETRIEVAL_COVERAGE_GAP: Required authoritative document, clause, appendix, legal text, or evidence simply wasn't retrieved.
+4. RETRIEVAL_PRECISION_ISSUE: Information retrieved, but evidence used is tangential, from wrong segment/context, or less applicable.
+5. CONTEXT_CONTINUITY_FAILURE: Relevant info already established earlier in conversation is ignored, forgotten, or unnecessarily re-requested.
+6. INTENT_MISINTERPRETATION: Assistant misunderstands what user is trying to accomplish (navigation, summarization, lookup, explanation).
+7. EXCESSIVE_GUARDRAIL: Legitimate request unnecessarily blocked/restricted because safety/policy boundaries are interpreted too broadly.
+8. INCOMPLETE_SAFE_ALTERNATIVE: Correctly identifies limit, but fails to provide permissible assistance like criteria, repository guidance, or next steps.
+9. QUALITY_OF_COMMUNICATION: Answer substantively available but poorly delivered (incomplete, overly verbose, vague, repetitive, badly structured).
+10. NONE: No failure detected (fully successful turn).
 
 OUTPUT REQUIREMENTS:
 Output strictly a valid JSON object matching this schema:
 {
   "step1_standalone_intent": "...",
-  "step2_constraint_audit": "...",
+  "step2_context_constraint_audit": "...",
   "step3_retrieval_grounding_audit": "...",
-  "completeness_score": 3,
-  "relevancy_score": 0.85,
-  "grounding_score": 1.0,
+  "primary_failure_theme": "EXACT_THEME_NAME_FROM_LIST_ABOVE",
   "matrix": {
-    "has_role_breach": false,
-    "has_material_risk": false,
-    "has_retrieval_precision_issue": false,
-    "has_intent_misclassification": false,
-    "has_version_control_failure": false,
-    "is_over_guardrailed": false,
-    "has_retrieval_dead_end": false,
-    "has_clarification_fatigue": false,
-    "has_context_amnesia": false,
-    "has_verbosity_fatigue": false,
-    "is_valid_askback": false,
-    "is_unmapped_failure": false
+    "insufficient_user_context": false,
+    "unnecessary_clarification": false,
+    "retrieval_coverage_gap": false,
+    "retrieval_precision_issue": false,
+    "context_continuity_failure": false,
+    "intent_misinterpretation": false,
+    "excessive_guardrail": false,
+    "incomplete_safe_alternative": false,
+    "quality_of_communication": false
   }
 }
 Do not include any code block markers or conversational preamble outside the JSON object.
 """
-
-# ==========================================
-# DETERMINISTIC SINGLE CATEGORY RESOLVER
-# ==========================================
-def resolve_primary_theme(matrix: AuditMatrix) -> str:
-    """Deterministically selects exactly ONE primary theme based on priority weights."""
-    active_themes = []
-    
-    if matrix.has_material_risk:
-        active_themes.append(("MATERIAL_RISK_FAILURE", THEME_WEIGHTS["MATERIAL_RISK_FAILURE"]))
-    if matrix.has_role_breach:
-        active_themes.append(("ROLE_BREACH", THEME_WEIGHTS["ROLE_BREACH"]))
-    if matrix.is_over_guardrailed:
-        active_themes.append(("OVER_GUARDRAILING", THEME_WEIGHTS["OVER_GUARDRAILING"]))
-    if matrix.has_retrieval_dead_end:
-        active_themes.append(("RETRIEVAL_DEAD_END", THEME_WEIGHTS["RETRIEVAL_DEAD_END"]))
-    if matrix.has_retrieval_precision_issue:
-        active_themes.append(("RETRIEVAL_PRECISION_ISSUE", THEME_WEIGHTS["RETRIEVAL_PRECISION_ISSUE"]))
-    if matrix.has_clarification_fatigue:
-        active_themes.append(("CLARIFICATION_FATIGUE", THEME_WEIGHTS["CLARIFICATION_FATIGUE"]))
-    if matrix.has_version_control_failure:
-        active_themes.append(("VERSION_CONTROL_FAILURE", THEME_WEIGHTS["VERSION_CONTROL_FAILURE"]))
-    if matrix.has_intent_misclassification:
-        active_themes.append(("INTENT_MISCLASSIFICATION", THEME_WEIGHTS["INTENT_MISCLASSIFICATION"]))
-    if matrix.has_context_amnesia:
-        active_themes.append(("CONTEXT_AMNESIA", THEME_WEIGHTS["CONTEXT_AMNESIA"]))
-    if matrix.is_valid_askback:
-        active_themes.append(("CLARIFICATION_REQUESTED", THEME_WEIGHTS["CLARIFICATION_REQUESTED"]))
-    if matrix.has_verbosity_fatigue:
-        active_themes.append(("VERBOSITY_FATIGUE", THEME_WEIGHTS["VERBOSITY_FATIGUE"]))
-    if matrix.is_unmapped_failure:
-        active_themes.append(("UNMAPPED_FAILURE", THEME_WEIGHTS["UNMAPPED_FAILURE"]))
-
-    if not active_themes:
-        return "NONE"
-
-    active_themes.sort(key=lambda x: x[1], reverse=True)
-    return active_themes[0][0]
 
 # ==========================================
 # DATABRICKS CLIENT & ASYNC API WRAPPER
@@ -225,7 +163,6 @@ w = WorkspaceClient()
     reraise=True
 )
 async def call_databricks_serving_api(prompt_text: str) -> str:
-    """Calls Databricks Model Serving endpoint asynchronously with backoff retry logic."""
     loop = asyncio.get_running_loop()
     
     def _sync_call():
@@ -256,12 +193,12 @@ async def evaluate_single_transaction(
     semaphore: asyncio.Semaphore,
     history_lookup: Dict[str, List[Dict[str, str]]]
 ) -> Dict[str, Any]:
-    """Processes a single transaction safely with sliding history window and concurrency semaphore."""
     async with semaphore:
         conv_id = str(row['conversation_id'])
         trans_id = str(row['transaction_id'])
         
-        full_history = history_lookup.get(conv_id, [])
+        # Retrieve history strictly accumulated UP TO this transaction
+        full_history = history_lookup.get(trans_id, [])
         bounded_history = full_history[-MAX_HISTORY_TURNS:] if len(full_history) > MAX_HISTORY_TURNS else full_history
         
         user_prompt = f"""
@@ -282,8 +219,6 @@ async def evaluate_single_transaction(
 """
         try:
             raw_response = await call_databricks_serving_api(user_prompt)
-            
-            # Robust JSON repair replacing naive stripping to prevent 300+ validation failures
             repaired_str = repair_json(raw_response)
             parsed = json.loads(repaired_str)
 
@@ -291,19 +226,14 @@ async def evaluate_single_transaction(
                 parsed["matrix"] = {}
 
             eval_obj = AuditEvaluationResponse(**parsed)
-            primary_theme = resolve_primary_theme(eval_obj.matrix)
             
             return {
                 "transaction_id": trans_id,
                 "conversation_id": conv_id,
                 "request_created_on": row['request_created_on'],
-                "completeness_score": eval_obj.completeness_score,
-                "relevancy_score": eval_obj.relevancy_score,
-                "grounding_score": eval_obj.grounding_score,
-                "primary_failure_theme": primary_theme,
-                "askback_triggered": eval_obj.matrix.is_valid_askback,
+                "primary_failure_theme": eval_obj.primary_failure_theme,
                 "step1_standalone_intent": eval_obj.step1_standalone_intent,
-                "step2_constraint_audit": eval_obj.step2_constraint_audit,
+                "step2_context_constraint_audit": eval_obj.step2_context_constraint_audit,
                 "step3_retrieval_grounding_audit": eval_obj.step3_retrieval_grounding_audit,
                 **eval_obj.matrix.dict(),
                 "audit_status": "SUCCESS",
@@ -316,13 +246,9 @@ async def evaluate_single_transaction(
                 "transaction_id": trans_id,
                 "conversation_id": conv_id,
                 "request_created_on": row['request_created_on'],
-                "completeness_score": None,
-                "relevancy_score": None,
-                "grounding_score": None,
                 "primary_failure_theme": "AUDIT_FAILURE",
-                "askback_triggered": None,
                 "step1_standalone_intent": None,
-                "step2_constraint_audit": None,
+                "step2_context_constraint_audit": None,
                 "step3_retrieval_grounding_audit": None,
                 **{k: None for k in AuditMatrix().dict().keys()},
                 "audit_status": "FAILED",
@@ -330,7 +256,7 @@ async def evaluate_single_transaction(
             }
 
 # ==========================================
-# DAILY CHECKPOINTING & MAIN PIPELINE
+# MAIN PIPELINE & CHECKPOINTING
 # ==========================================
 async def run_audit_pipeline():
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -345,13 +271,18 @@ async def run_audit_pipeline():
     df['request_created_on_dt'] = pd.to_datetime(df['request_created_on'])
     df = df.sort_values(by=['conversation_id', 'request_created_on_dt'])
     
-    logger.info("Building multi-turn conversation lookup maps...")
+    logger.info("Building secure chronological conversation history maps...")
     history_lookup: Dict[str, List[Dict[str, str]]] = {}
-    for conv_id, group in df.groupby('conversation_id'):
-        history_list = []
+    
+    # Iterate conversation groups and build history incrementally per transaction
+    for conv_id, group in df.groupby('conversation_id', sort=False):
+        conversation_history = []
         for _, r in group.iterrows():
-            history_list.append({"user": str(r['request']), "agent": str(r['response'])})
-        history_lookup[str(conv_id)] = history_list
+            trans_id = str(r['transaction_id'])
+            # Store a copy of history strictly occurring BEFORE this transaction turn
+            history_lookup[trans_id] = list(conversation_history)
+            # Append current turn to rolling history for subsequent turns in this conversation
+            conversation_history.append({"user": str(r['request']), "agent": str(r['response'])})
 
     df['date_key'] = df['request_created_on_dt'].dt.date
     unique_dates = sorted(df['date_key'].unique())
