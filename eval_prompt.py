@@ -1,8 +1,100 @@
+AUDITOR_SYSTEM_PROMPT = """You are an enterprise AI Compliance & RAG Auditor evaluating a Bank Policy Assistant.
+Your task is to analyze user interactions, verify retrieval sufficiency against reframed intents, and identify root-cause failure themes using the governing policy framework below.
+
+===============================================================================
+EVALUATION PIPELINE & STATE MACHINE
+===============================================================================
+
+-------------------------------------------------------------------------------
+PHASE 1: CONTEXTUAL INTENT REFRAMING (MEMORY + REQUEST)
+-------------------------------------------------------------------------------
+1. Read the full conversation history alongside the immediate user request.
+2. Reframe the immediate request into a single, fully explicit Standalone Intent:
+   - Resolve all pronouns, implicit references, context shifts, and past constraints.
+   - Combine implied context from history with current requirements into a unified operational query.
+   - DO NOT over-deconstruct into micro-subintents. Keep the intent holistic.
+
+-------------------------------------------------------------------------------
+PHASE 2: INTENT-DRIVEN RETRIEVAL AUDIT
+-------------------------------------------------------------------------------
+Compare the Reframed Standalone Intent directly against the retrieved document chunks:
+- COVERAGE CHECK: Does the retrieved text contain authoritative bank policy clauses capable of satisfying the Reframed Standalone Intent?
+- PRECISION CHECK: Is the retrieved evidence targeted to the correct scope (jurisdiction, account type, entity, or policy version)?
+
+-------------------------------------------------------------------------------
+PHASE 3: SEQUENTIAL EVALUATION GATES
+-------------------------------------------------------------------------------
+GATE 1: EXPECTED BEHAVIOR CHECK
+- Did the assistant fulfill the Reframed Standalone Intent using retrieved evidence accurately, respecting past constraints without excessive clarification or unnecessary guardrails?
+- If YES -> Primary Theme: EXPECTED_BEHAVIOR. Stop further gate evaluation.
+
+GATE 2: CONTEXT CONTINUITY & AMNESIA CHECK
+- Did the assistant ignore, contradict, or re-request information already established in the conversation memory?
+- If YES -> Flag CONTEXT_CONTINUITY_FAILURE.
+
+GATE 3: RETRIEVAL FAILURE CHECK
+- Sub-case A (Coverage Gap): Required policy clauses for the Reframed Standalone Intent are missing from retrieved chunks -> Flag RETRIEVAL_COVERAGE_GAP.
+- Sub-case B (Precision Issue): Chunks were retrieved, but apply to the wrong segment, product, or scope -> Flag RETRIEVAL_PRECISION_ISSUE.
+
+GATE 4: BEHAVIORAL & POLICY CHECK
+- INTENT MISINTERPRETATION: Did the assistant execute the wrong operational task type (e.g., summarized a process when asked for specific eligibility criteria)?
+- EXCESSIVE GUARDRAIL: Did the assistant issue an unnecessary refusal/disclaimer on a legitimate policy lookup when valid evidence was available?
+- UNNECESSARY CLARIFICATION: Did the assistant ask follow-up questions when the Reframed Standalone Intent could have been answered directly or via a simple conditional statement?
+
+GATE 5: UNMAPPED THEME DISCOVERY
+- Does the failure mode fall outside all predefined matrix categories?
+- If YES -> Set primary_failure_theme to "UNMAPPED", and generate a concise, standardized theme name in `proposed_new_theme_name` (e.g., "STALE_POLICY_CITATION").
+
+===============================================================================
+CANONICAL ABSTRACT EXAMPLES
+===============================================================================
+
+[EXAMPLE 1: CONTEXTUAL REFRAMING + COVERAGE GAP]
+- History: User states they are auditing a Commercial Business Account.
+- Immediate Request: "What is the daily wire limit?"
+- Reframed Intent: "What is the daily wire limit for a Commercial Business Account?"
+- Context Chunks: Documents only contain daily wire limits for Retail Personal Accounts.
+- Assistant Response: "The daily wire limit is $10,000." (Uses retail limit).
+- Evaluation: RETRIEVAL_COVERAGE_GAP (Reframed intent required commercial policy; retrieval provided retail policy).
+
+[EXAMPLE 2: SUBTLE CLARIFICATION VS. UNNECESSARY CLARIFICATION]
+- Reframed Intent: "What are the account opening requirements for [Entity_Type]?"
+- Assistant Response: "For LLCs, submit X. For Corporations, submit Y. Which entity type are you registering?"
+- Evaluation: EXPECTED_BEHAVIOR (Provided a clean conditional answer while asking a valid follow-up; DO NOT flag UNNECESSARY_CLARIFICATION).
+
+===============================================================================
+OUTPUT SCHEMA REQUIREMENTS
+===============================================================================
+Output strictly a valid JSON object matching this structure:
+{
+  "reframed_standalone_intent": "Core query synthesized from conversation memory and current request.",
+  "reasoning_steps": {
+    "intent_and_retrieval_analysis": "Assessment of reframed intent against retrieved chunks.",
+    "gate_evaluations": "Step-by-step walkthrough of Gates 1 through 5."
+  },
+  "primary_failure_theme": "EXACT_THEME_NAME",
+  "proposed_new_theme_name": "UPPERCASE_SNAKE_CASE_THEME_NAME_OR_NULL",
+  "matrix": {
+    "insufficient_user_context": false,
+    "unnecessary_clarification": false,
+    "retrieval_coverage_gap": false,
+    "retrieval_precision_issue": false,
+    "context_continuity_failure": false,
+    "intent_misinterpretation": false,
+    "excessive_guardrail": false,
+    "incomplete_safe_alternative": false,
+    "quality_of_communication": false
+  }
+}
+Do not include any code block markers or extra conversational prose.
+"""
+
+
 import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 import pandas as pd
 from pydantic import BaseModel, Field, field_validator
 from json_repair import repair_json
@@ -16,7 +108,7 @@ logger = logging.getLogger("RAG_Matrix_Auditor")
 # ==========================================
 # CONFIGURATION & HYPERPARAMETERS
 # ==========================================
-SERVING_ENDPOINT_NAME = "databricks-dbrx-instruct"  # Replace with your endpoint / model name
+SERVING_ENDPOINT_NAME = "databricks-dbrx-instruct"
 MAX_CONCURRENT_CALLS = 10
 MAX_HISTORY_TURNS = 5
 CHECKPOINT_DIR = Path("./audit_checkpoints")
@@ -38,36 +130,18 @@ ALLOWED_THEMES = {
 }
 
 # ==========================================
-# ROBUST PYDANTIC SCHEMAS
+# PYDANTIC SCHEMAS
 # ==========================================
 class AuditMatrix(BaseModel):
-    insufficient_user_context: bool = Field(
-        default=False, description="TRUE if request lacks info required to determine policy/scenario/entity, making clarification appropriate."
-    )
-    unnecessary_clarification: bool = Field(
-        default=False, description="TRUE if enough info exists or a conditional answer could have been provided before asking questions."
-    )
-    retrieval_coverage_gap: bool = Field(
-        default=False, description="TRUE if the required authoritative document, clause, legal text, or evidence simply wasn't retrieved at all."
-    )
-    retrieval_precision_issue: bool = Field(
-        default=False, description="TRUE if info was retrieved, but evidence used is tangential, from wrong context, or less applicable."
-    )
-    context_continuity_failure: bool = Field(
-        default=False, description="TRUE if relevant info/constraints established earlier in conversation are ignored, forgotten, or re-requested."
-    )
-    intent_misinterpretation: bool = Field(
-        default=False, description="TRUE if assistant misunderstands what user is trying to accomplish (lookup vs summary vs explanation or wrong decision trigger)."
-    )
-    excessive_guardrail: bool = Field(
-        default=False, description="TRUE if a legitimate request is unnecessarily blocked because safety/policy boundaries are interpreted too broadly."
-    )
-    incomplete_safe_alternative: bool = Field(
-        default=False, description="TRUE if assistant identifies a limitation, but fails to provide permissible next steps, escalation, or repository guidance."
-    )
-    quality_of_communication: bool = Field(
-        default=False, description="TRUE if answer is substantively correct but poorly delivered (verbose, vague, repetitive, badly structured)."
-    )
+    insufficient_user_context: bool = Field(default=False)
+    unnecessary_clarification: bool = Field(default=False)
+    retrieval_coverage_gap: bool = Field(default=False)
+    retrieval_precision_issue: bool = Field(default=False)
+    context_continuity_failure: bool = Field(default=False)
+    intent_misinterpretation: bool = Field(default=False)
+    excessive_guardrail: bool = Field(default=False)
+    incomplete_safe_alternative: bool = Field(default=False)
+    quality_of_communication: bool = Field(default=False)
 
     @field_validator("*", mode="before")
     def coerce_booleans(cls, v):
@@ -75,26 +149,20 @@ class AuditMatrix(BaseModel):
             return v.strip().lower() in ("true", "1", "yes")
         return bool(v) if v is not None else False
 
+class ReasoningSteps(BaseModel):
+    intent_and_retrieval_analysis: str = Field(default="")
+    gate_evaluations: str = Field(default="")
+
 class AuditEvaluationResponse(BaseModel):
-    step1_standalone_intent: str = Field(
-        default="", description="Step 1 analysis capturing request alongside chronological conversation history up to 5 turns."
+    reframed_standalone_intent: str = Field(
+        default="", description="Reframed intent synthesized from conversation history and immediate prompt."
     )
-    step2_context_constraint_audit: str = Field(
-        default="", description="Step 2 analysis evaluating past constraints, context amnesia, role boundaries, and conversation continuity."
-    )
-    step3_retrieval_grounding_audit: str = Field(
-        default="", description="Step 3 holistic analysis comparing response against retrieved document chunks and identifying root causes."
-    )
-    primary_failure_theme: str = Field(
-        default="UNMAPPED", description="The single most accurate primary root-cause theme selected by the LLM from the allowed list."
+    reasoning_steps: ReasoningSteps = Field(default_factory=ReasoningSteps)
+    primary_failure_theme: str = Field(default="UNMAPPED")
+    proposed_new_theme_name: Optional[str] = Field(
+        default=None, description="Suggested theme name if primary_failure_theme is UNMAPPED."
     )
     matrix: AuditMatrix = Field(default_factory=AuditMatrix)
-
-    @field_validator("step1_standalone_intent", "step2_context_constraint_audit", "step3_retrieval_grounding_audit", mode="before")
-    def coerce_to_string(cls, v):
-        if isinstance(v, (dict, list)):
-            return json.dumps(v)
-        return str(v) if v is not None else ""
 
     @field_validator("primary_failure_theme", mode="before")
     def coerce_theme(cls, v):
@@ -102,67 +170,7 @@ class AuditEvaluationResponse(BaseModel):
         return theme if theme in ALLOWED_THEMES else "UNMAPPED"
 
 # ==========================================
-# SYSTEM PROMPT (LLM ROOT-CAUSE SELECTION)
-# ==========================================
-AUDITOR_SYSTEM_PROMPT = """You are an expert external AI Auditor evaluating enterprise RAG conversations.
-Follow this explicit 3-step holistic evaluation process before assigning multi-label flags and selecting the single primary failure theme.
-
-CRITICAL DISAMBIGUATION RULES FOR ROOT CAUSES:
-1. **Over-Guardrailing vs Retrieval Dead End**: If an assistant gives a generic refusal because no useful evidence was retrieved, determine if the root cause was a **RETRIEVAL_COVERAGE_GAP** (missing evidence) rather than **EXCESSIVE_GUARDRAIL**. Do not mislabel empty retrieval as a policy block.
-2. **Over-Guardrailing vs Intent Misinterpretation**: If the assistant refuses because it incorrectly assumes the user is asking for a definitive decision/action it cannot take, classify the primary root cause as **INTENT_MISINTERPRETATION**.
-3. **Retrieval Coverage vs Precision**: Distinguish clearly between required evidence not being retrieved at all (**RETRIEVAL_COVERAGE_GAP**) vs. evidence being retrieved but being tangential or from the wrong segment (**RETRIEVAL_PRECISION_ISSUE**).
-4. **Clarification Audit**: Do not mark clarification requests as uniformly valid. Test whether a useful conditional answer could have been provided before asking follow-up questions. If unnecessary, flag **UNNECESSARY_CLARIFICATION**.
-5. **Context Continuity / Amnesia**: Pay close attention to multi-turn memory. If constraints established earlier in the conversation are ignored or re-requested, flag **CONTEXT_CONTINUITY_FAILURE**.
-
-STEP 1: STANDALONE INTENT EXTRACTION
-- Analyze the immediate user request alongside past conversation history up to 5 turns (strictly evaluated without future peeking).
-- State the explicit intent and goal of the user request.
-
-STEP 2: CONTEXT & CONSTRAINT AUDIT
-- Check if previous conversation constraints or established facts were respected, or if context amnesia occurred.
-- Evaluate whether clarification was genuinely required or if the assistant created unnecessary loops.
-
-STEP 3: HOLISTIC RETRIEVAL & GROUNDING CHECK
-- Evaluate the response against the provided document chunks.
-- Separate primary root-cause failure from secondary compounding issues.
-
-ALLOWED THEMES TO CHOOSE FROM FOR primary_failure_theme:
-1. INSUFFICIENT_USER_CONTEXT: Request lacks info required to determine policy/scenario/entity/product/role. Clarification appropriate.
-2. UNNECESSARY_CLARIFICATION: Enough info already exists or conditional answer was possible, but assistant asks additional questions or creates loops.
-3. RETRIEVAL_COVERAGE_GAP: Required authoritative document, clause, appendix, legal text, or evidence simply wasn't retrieved.
-4. RETRIEVAL_PRECISION_ISSUE: Information retrieved, but evidence used is tangential, from wrong segment/context, or less applicable.
-5. CONTEXT_CONTINUITY_FAILURE: Relevant info already established earlier in conversation is ignored, forgotten (context amnesia), or unnecessarily re-requested.
-6. INTENT_MISINTERPRETATION: Assistant misunderstands what user is trying to accomplish (navigation, summarization, lookup, explanation, or wrong decision trigger).
-7. EXCESSIVE_GUARDRAIL: Legitimate request unnecessarily blocked/restricted because safety/policy boundaries are interpreted too broadly.
-8. INCOMPLETE_SAFE_ALTERNATIVE: Correctly identifies limit, but fails to provide permissible assistance like criteria, repository guidance, or next steps.
-9. QUALITY_OF_COMMUNICATION: Answer substantively available but poorly delivered (incomplete, overly verbose, vague, repetitive, badly structured).
-10. EXPECTED_BEHAVIOR: No failure detected; fully successful and appropriate turn.
-11. UNMAPPED: Anomalous behavior or failure mode that does not fall into any of the above categories, or when an issue occurs but cannot be categorized under existing themes.
-
-OUTPUT REQUIREMENTS:
-Output strictly a valid JSON object matching this schema:
-{
-  "step1_standalone_intent": "...",
-  "step2_context_constraint_audit": "...",
-  "step3_retrieval_grounding_audit": "...",
-  "primary_failure_theme": "EXACT_THEME_NAME_FROM_LIST_ABOVE",
-  "matrix": {
-    "insufficient_user_context": false,
-    "unnecessary_clarification": false,
-    "retrieval_coverage_gap": false,
-    "retrieval_precision_issue": false,
-    "context_continuity_failure": false,
-    "intent_misinterpretation": false,
-    "excessive_guardrail": false,
-    "incomplete_safe_alternative": false,
-    "quality_of_communication": false
-  }
-}
-Do not include any code block markers or conversational preamble outside the JSON object.
-"""
-
-# ==========================================
-# DATABRICKS CLIENT & ASYNC API WRAPPER
+# DATABRICKS API WRAPPER
 # ==========================================
 w = WorkspaceClient()
 
@@ -206,24 +214,23 @@ async def evaluate_single_transaction(
         conv_id = str(row['conversation_id'])
         trans_id = str(row['transaction_id'])
         
-        # Retrieve history strictly accumulated UP TO this transaction (no future peek)
         full_history = history_lookup.get(trans_id, [])
         bounded_history = full_history[-MAX_HISTORY_TURNS:] if len(full_history) > MAX_HISTORY_TURNS else full_history
         
         user_prompt = f"""
-### AUDIT TARGET:
+### TRANSACTION AUDIT INPUT:
 - Transaction ID: {trans_id}
 - Conversation ID: {conv_id}
-- History Context ({len(bounded_history)} prior turns):
+- Conversation History ({len(bounded_history)} prior turns):
 {json.dumps(bounded_history, indent=2)}
 
-- Document Chunks (Retrieved):
+- Retrieved Document Chunks:
 {row['document_chunks']}
 
 - Immediate User Request:
 {row['request']}
 
-- Generation Stage Response:
+- Generated Assistant Response:
 {row['response']}
 """
         try:
@@ -240,10 +247,11 @@ async def evaluate_single_transaction(
                 "transaction_id": trans_id,
                 "conversation_id": conv_id,
                 "request_created_on": row['request_created_on'],
+                "reframed_standalone_intent": eval_obj.reframed_standalone_intent,
                 "primary_failure_theme": eval_obj.primary_failure_theme,
-                "step1_standalone_intent": eval_obj.step1_standalone_intent,
-                "step2_context_constraint_audit": eval_obj.step2_context_constraint_audit,
-                "step3_retrieval_grounding_audit": eval_obj.step3_retrieval_grounding_audit,
+                "proposed_new_theme_name": eval_obj.proposed_new_theme_name,
+                "intent_and_retrieval_analysis": eval_obj.reasoning_steps.intent_and_retrieval_analysis,
+                "gate_evaluations": eval_obj.reasoning_steps.gate_evaluations,
                 **eval_obj.matrix.dict(),
                 "audit_status": "SUCCESS",
                 "error_message": None
@@ -255,17 +263,18 @@ async def evaluate_single_transaction(
                 "transaction_id": trans_id,
                 "conversation_id": conv_id,
                 "request_created_on": row['request_created_on'],
+                "reframed_standalone_intent": None,
                 "primary_failure_theme": "AUDIT_FAILURE",
-                "step1_standalone_intent": None,
-                "step2_context_constraint_audit": None,
-                "step3_retrieval_grounding_audit": None,
+                "proposed_new_theme_name": None,
+                "intent_and_retrieval_analysis": None,
+                "gate_evaluations": None,
                 **{k: None for k in AuditMatrix().dict().keys()},
                 "audit_status": "FAILED",
                 "error_message": str(e)
             }
 
 # ==========================================
-# MAIN PIPELINE & CHECKPOINTING
+# MAIN PIPELINE
 # ==========================================
 async def run_audit_pipeline():
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,17 +289,14 @@ async def run_audit_pipeline():
     df['request_created_on_dt'] = pd.to_datetime(df['request_created_on'])
     df = df.sort_values(by=['conversation_id', 'request_created_on_dt'])
     
-    logger.info("Building secure chronological conversation history maps...")
+    logger.info("Building chronological conversation history maps...")
     history_lookup: Dict[str, List[Dict[str, str]]] = {}
     
-    # Iterate conversation groups and build history incrementally per transaction
     for conv_id, group in df.groupby('conversation_id', sort=False):
         conversation_history = []
         for _, r in group.iterrows():
             trans_id = str(r['transaction_id'])
-            # Store a copy of history strictly occurring BEFORE this transaction turn
             history_lookup[trans_id] = list(conversation_history)
-            # Append current turn to rolling history for subsequent turns in this conversation
             conversation_history.append({"user": str(r['request']), "agent": str(r['response'])})
 
     df['date_key'] = df['request_created_on_dt'].dt.date
@@ -303,7 +309,7 @@ async def run_audit_pipeline():
         checkpoint_file = CHECKPOINT_DIR / f"audit_checkpoint_{current_date}.csv"
         
         if checkpoint_file.exists():
-            logger.info(f"Skipping date {current_date} — Checkpoint already exists.")
+            logger.info(f"Skipping date {current_date} — Checkpoint exists.")
             continue
             
         logger.info(f"Processing transactions for date: {current_date}...")
@@ -326,8 +332,6 @@ async def run_audit_pipeline():
         master_df = pd.concat([pd.read_csv(f) for f in all_checkpoints], ignore_index=True)
         master_df.to_csv(OUTPUT_MASTER_CSV, index=False)
         logger.info(f"Pipeline complete! Master file saved to {OUTPUT_MASTER_CSV}")
-    else:
-        logger.warning("No checkpoint files found.")
 
 if __name__ == "__main__":
     asyncio.run(run_audit_pipeline())
