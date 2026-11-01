@@ -25,12 +25,16 @@ logger = logging.getLogger("RAG_Atomic_Matrix_Auditor")
 
 
 # ==========================================
-# PHASE 1: ATOMIC BOOLEAN SCHEMA (Pydantic v2)
+# PHASE 1: ATOMIC SCHEMA WITH INTENT REFRAMING
 # ==========================================
 class AtomicAuditFlags(BaseModel):
+    step1_contextualized_request: str = Field(
+        ..., 
+        description="Reframed standalone query explicitly synthesizing preceding conversation history, implicit preferences, past constraints, and the immediate request."
+    )
     audit_rationale: str = Field(
         ..., 
-        description="A thorough rationale citing specific evidence from preceding history, chunks, and response. Explicitly note user-driven scope changes versus assistant contradictions."
+        description="A thorough rationale citing specific evidence from preceding history, chunks, and response to justify the state of each flag."
     )
 
     # Layer 1: Conversation Memory & Input State
@@ -66,7 +70,7 @@ class AtomicAuditFlags(BaseModel):
 
     # Layer 3: Response Structural Type (Mutually Exclusive Shapes)
     FLAG_RESP_SHAPE_DIRECT_STATEMENT: bool = Field(
-        ..., description="Primary structure asserts factual or policy rules directly (Set True ONLY if not an ask-back)."
+        ..., description="Primary structure asserts factual or policy rules directly."
     )
     FLAG_RESP_SHAPE_CONDITIONAL_STATEMENT: bool = Field(
         ..., description="Primary structure provides structured If/Then scenario logic."
@@ -148,15 +152,16 @@ class AtomicAuditFlags(BaseModel):
 
 
 # ==========================================
-# PHASE 1 SYSTEM PROMPT (UPGRADED LOGIC)
+# PHASE 1 SYSTEM PROMPT
 # ==========================================
 ATOMIC_AUDITOR_SYSTEM_PROMPT = """You are an objective, mathematical audit sensor for an enterprise RAG assistant serving bank policy queries.
 Your task is to analyze the preceding conversation history, retrieved document chunks, and latest assistant response, and output a JSON object adhering to the specified schema.
 
-### Core Guidelines:
-1. **Rationale First:** Draft a thorough `audit_rationale` analyzing memory state, retrieval coverage, response shape, and execution mechanics. Explicitly verify if user constraints changed mid-dialogue.
-2. **Atomic Measurement:** Act strictly as an independent binary sensor. Do not guess overall failure themes.
-3. **Shape Mutually Exclusive Rule:** Select EXACTLY ONE response shape flag (`FLAG_RESP_SHAPE_*`). If an assistant response combines a statement with a follow-up question, prioritize `FLAG_RESP_SHAPE_ASKBACK`.
+### Execution Instructions:
+1. **Step 1 Intent Synthesis:** First, synthesize conversation memory and the immediate user request into a clean, standalone operational query (`step1_contextualized_request`).
+2. **Rationale Draft:** Draft a thorough `audit_rationale` explaining factual observations across memory, retrieval, response shape, and execution.
+3. **Atomic Measurement:** Act strictly as an independent binary sensor for the 27 boolean flags.
+4. **Shape Rule:** Select EXACTLY ONE response shape flag (`FLAG_RESP_SHAPE_*`). Prioritize `FLAG_RESP_SHAPE_ASKBACK` if a follow-up question is present alongside statements.
 """
 
 
@@ -166,16 +171,18 @@ Your task is to analyze the preceding conversation history, retrieved document c
 class AuditVerdict(BaseModel):
     primary_failure_theme: str
     is_defect: bool
+    step1_contextualized_request: str
     audit_rationale: str
     audit_notes: List[str]
     atomic_flags_dict: Dict[str, Any]
 
 
 def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
+    intent_req = flags_dict.get("step1_contextualized_request", "")
     audit_rationale = flags_dict.get("audit_rationale", "No rationale provided.")
     notes: List[str] = []
 
-    # Sanity Gate: Validate Mutually Exclusive Response Shapes
+    # Sanity Gate: Mutually Exclusive Response Shapes
     shape_flags = [
         "FLAG_RESP_SHAPE_DIRECT_STATEMENT",
         "FLAG_RESP_SHAPE_CONDITIONAL_STATEMENT",
@@ -188,8 +195,9 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
     if len(active_shapes) != 1:
         notes.append(f"Sanity Gate Failure: Expected exactly 1 response shape, found {len(active_shapes)}: {active_shapes}")
         return AuditVerdict(
-            primary_failure_theme="UNMAPPED_LOGICAL_ANOMALY",
+            primary_failure_theme="UNMAPPED",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=notes,
             atomic_flags_dict=flags_dict
@@ -203,10 +211,11 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
             flags_dict.get("FLAG_QUERY_UNDER_SPECIFIED", False)
         ):
             return AuditVerdict(
-                primary_failure_theme="CLARIFICATION_REQUESTED",
+                primary_failure_theme="EXPECTED_BEHAVIOR",
                 is_defect=False,
+                step1_contextualized_request=intent_req,
                 audit_rationale=audit_rationale,
-                audit_notes=["Tier 1: Valid Ask-Back detected."],
+                audit_notes=["Tier 1: Valid Ask-Back / Clarification Requested."],
                 atomic_flags_dict=flags_dict
             )
         
@@ -219,14 +228,16 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
             return AuditVerdict(
                 primary_failure_theme="UNNECESSARY_CLARIFICATION",
                 is_defect=True,
+                step1_contextualized_request=intent_req,
                 audit_rationale=audit_rationale,
-                audit_notes=["Tier 1: Unnecessary / Redundant Ask-Back detected."],
+                audit_notes=["Tier 1: Unnecessary / Redundant Ask-Back."],
                 atomic_flags_dict=flags_dict
             )
         
         return AuditVerdict(
             primary_failure_theme="UNNECESSARY_CLARIFICATION",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=["Tier 1: Unmapped Ask-Back fallback."],
             atomic_flags_dict=flags_dict
@@ -237,6 +248,7 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
         return AuditVerdict(
             primary_failure_theme="CONTEXT_CONTINUITY_FAILURE",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=["Tier 2: Historical constraint contradicted."],
             atomic_flags_dict=flags_dict
@@ -247,6 +259,7 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
         return AuditVerdict(
             primary_failure_theme="RETRIEVAL_PRECISION_ISSUE",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=["Tier 3: Wrong entity or scope retrieved."],
             atomic_flags_dict=flags_dict
@@ -257,15 +270,17 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
             return AuditVerdict(
                 primary_failure_theme="EXPECTED_BEHAVIOR",
                 is_defect=False,
+                step1_contextualized_request=intent_req,
                 audit_rationale=audit_rationale,
-                audit_notes=["Tier 3: Empty retrieval with accurate boundary declaration."],
+                audit_notes=["Tier 3: Empty retrieval with accurate boundary."],
                 atomic_flags_dict=flags_dict
             )
         return AuditVerdict(
             primary_failure_theme="RETRIEVAL_COVERAGE_GAP",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
-            audit_notes=["Tier 3: Empty retrieval without valid boundary declaration."],
+            audit_notes=["Tier 3: Empty retrieval without valid boundary."],
             atomic_flags_dict=flags_dict
         )
 
@@ -280,8 +295,9 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
             return AuditVerdict(
                 primary_failure_theme="INTENT_MISINTERPRETATION",
                 is_defect=True,
+                step1_contextualized_request=intent_req,
                 audit_rationale=audit_rationale,
-                audit_notes=["Tier 4: Logic misapplied or hallucinated assertion over chunks."],
+                audit_notes=["Tier 4: Logic misapplied or hallucinated assertion."],
                 atomic_flags_dict=flags_dict
             )
 
@@ -290,6 +306,7 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
             return AuditVerdict(
                 primary_failure_theme="RETRIEVAL_COVERAGE_GAP",
                 is_defect=True,
+                step1_contextualized_request=intent_req,
                 audit_rationale=audit_rationale,
                 audit_notes=["Tier 4: Unhandled partial coverage gap."],
                 atomic_flags_dict=flags_dict
@@ -300,6 +317,7 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
         return AuditVerdict(
             primary_failure_theme="EXCESSIVE_GUARDRAIL",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=["Tier 5: Excessive safety refusal."],
             atomic_flags_dict=flags_dict
@@ -309,6 +327,7 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
         return AuditVerdict(
             primary_failure_theme="INCOMPLETE_SAFE_ALTERNATIVE",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=["Tier 5: Broken safe alternative path."],
             atomic_flags_dict=flags_dict
@@ -319,33 +338,18 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
         return AuditVerdict(
             primary_failure_theme="QUALITY_OF_COMMUNICATION",
             is_defect=True,
+            step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
             audit_notes=["Tier 6: Poor communication quality."],
             atomic_flags_dict=flags_dict
         )
 
-    has_any_defect_flag = any([
-        flags_dict.get("FLAG_HIST_CONSTRAINTS_CONTRADICTED", False),
-        flags_dict.get("FLAG_RET_WRONG_ENTITY_OR_SCOPE", False),
-        flags_dict.get("FLAG_EXEC_UNSUPPORTED_ASSERTION", False),
-        flags_dict.get("FLAG_EXEC_MISAPPLIED_LOGIC", False),
-        flags_dict.get("FLAG_REFUSAL_EXCESSIVE", False)
-    ])
-
-    if not has_any_defect_flag:
-        return AuditVerdict(
-            primary_failure_theme="EXPECTED_BEHAVIOR",
-            is_defect=False,
-            audit_rationale=audit_rationale,
-            audit_notes=["Clean Pass: Expected behavior."],
-            atomic_flags_dict=flags_dict
-        )
-
     return AuditVerdict(
-        primary_failure_theme="UNMAPPED",
-        is_defect=True,
+        primary_failure_theme="EXPECTED_BEHAVIOR",
+        is_defect=False,
+        step1_contextualized_request=intent_req,
         audit_rationale=audit_rationale,
-        audit_notes=["Fallback Catch-All Triggered."],
+        audit_notes=["Clean Pass: Expected behavior."],
         atomic_flags_dict=flags_dict
     )
 
@@ -385,7 +389,7 @@ async def call_databricks_serving_api(prompt_text: str) -> str:
 
 
 # ==========================================
-# ASYNC WORKER FUNCTION (Safe NaN Handling)
+# ASYNC WORKER FUNCTION
 # ==========================================
 async def evaluate_single_transaction(
     row: pd.Series, 
@@ -399,7 +403,6 @@ async def evaluate_single_transaction(
         full_history = history_lookup.get(trans_id, [])
         preceding_history = full_history[-MAX_HISTORY_TURNS:] if len(full_history) > MAX_HISTORY_TURNS else full_history
         
-        # Safely handle potential NaN or null values in CSV cells
         doc_chunks = str(row['document_chunks']) if pd.notna(row['document_chunks']) else "[No Chunks Provided]"
         req_text = str(row['request']) if pd.notna(row['request']) else ""
         resp_text = str(row['response']) if pd.notna(row['response']) else ""
@@ -425,7 +428,7 @@ async def evaluate_single_transaction(
             repaired_str = repair_json(raw_response)
             parsed = json.loads(repaired_str)
 
-            # Pydantic v2 model validation & model_dump() utilization
+            # Pydantic v2 validation and model_dump()
             atomic_obj = AtomicAuditFlags(**parsed)
             flags_dict = atomic_obj.model_dump()
             
@@ -435,6 +438,7 @@ async def evaluate_single_transaction(
                 "transaction_id": trans_id,
                 "conversation_id": conv_id,
                 "request_created_on": row.get('request_created_on'),
+                "step1_contextualized_request": verdict.step1_contextualized_request,
                 "primary_failure_theme": verdict.primary_failure_theme,
                 "is_defect": verdict.is_defect,
                 "audit_rationale": verdict.audit_rationale,
@@ -447,11 +451,12 @@ async def evaluate_single_transaction(
             
         except Exception as e:
             logger.error(f"Failed processing Transaction {trans_id}: {str(e)}")
-            empty_flags = {k: False for k in AtomicAuditFlags.model_fields.keys() if k != 'audit_rationale'}
+            empty_flags = {k: False for k in AtomicAuditFlags.model_fields.keys() if k not in ('step1_contextualized_request', 'audit_rationale')}
             fail_row = {
                 "transaction_id": trans_id,
                 "conversation_id": conv_id,
                 "request_created_on": row.get('request_created_on'),
+                "step1_contextualized_request": None,
                 "primary_failure_theme": "AUDIT_FAILURE",
                 "is_defect": True,
                 "audit_rationale": None,
@@ -479,7 +484,7 @@ async def run_audit_pipeline():
     logger.info("Building secure chronological conversation history maps iteratively...")
     history_lookup: Dict[str, List[Dict[str, str]]] = {}
     
-    # Iterate conversation groups in natural input order without re-sorting
+    # Iterate conversation groups in natural input order without sorting
     for conv_id, group in df.groupby('conversation_id', sort=False):
         conversation_history = []
         for _, r in group.iterrows():
