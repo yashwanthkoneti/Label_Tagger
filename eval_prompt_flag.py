@@ -25,119 +25,119 @@ logger = logging.getLogger("RAG_Atomic_Matrix_Auditor")
 
 
 # ==========================================
-# PHASE 1: ATOMIC SCHEMA WITH INTENT REFRAMING
+# PHASE 1: ATOMIC SCHEMA WITH SAFE DEFAULTS
 # ==========================================
 class AtomicAuditFlags(BaseModel):
     step1_contextualized_request: str = Field(
-        ..., 
+        default="", 
         description="Reframed standalone query explicitly synthesizing preceding conversation history, implicit preferences, past constraints, and the immediate request."
     )
     audit_rationale: str = Field(
-        ..., 
+        default="", 
         description="A thorough rationale citing specific evidence from preceding history, chunks, and response to justify the state of each flag."
     )
 
     # Layer 1: Conversation Memory & Input State
     FLAG_HIST_HAS_EXPLICIT_CONSTRAINTS: bool = Field(
-        ..., description="Preceding turns contain explicit user constraints (account tier, jurisdiction, entity type, etc.)."
+        default=False, description="Preceding turns contain explicit user constraints (account tier, jurisdiction, entity type, etc.)."
     )
     FLAG_HIST_CONSTRAINTS_CONTRADICTED: bool = Field(
-        ..., description="Assistant unprompted contradicts an active, unrevoked constraint established in preceding history."
+        default=False, description="Assistant unprompted contradicts an active, unrevoked constraint established in preceding history."
     )
     FLAG_HIST_CONSTRAINTS_REREQUESTED: bool = Field(
-        ..., description="Assistant asks for a parameter/constraint already explicitly provided in preceding turns."
+        default=False, description="Assistant asks for a parameter/constraint already explicitly provided in preceding turns."
     )
     FLAG_HIST_CONTEXT_FULLY_PRESERVED: bool = Field(
-        ..., description="Assistant seamlessly preserves all historical parameters from preceding turns without loss."
+        default=False, description="Assistant seamlessly preserves all historical parameters from preceding turns without loss."
     )
 
     # Layer 2: Retrieval & Grounding State
     FLAG_RET_CHUNK_COUNT_ZERO: bool = Field(
-        ..., description="Zero document chunks returned by the retriever."
+        default=False, description="Zero document chunks returned by the retriever."
     )
     FLAG_RET_CONTAINS_FULL_ANSWER: bool = Field(
-        ..., description="Retrieved chunks contain complete, explicit policy text needed to satisfy request."
+        default=False, description="Retrieved chunks contain complete, explicit policy text needed to satisfy request."
     )
     FLAG_RET_CONTAINS_PARTIAL_ANSWER: bool = Field(
-        ..., description="Retrieved chunks cover only a fraction of the request, leaving key clauses or limits missing."
+        default=False, description="Retrieved chunks cover only a fraction of the request, leaving key clauses or limits missing."
     )
     FLAG_RET_WRONG_ENTITY_OR_SCOPE: bool = Field(
-        ..., description="Retrieved chunks explicitly describe a different product, jurisdiction, or entity tier."
+        default=False, description="Retrieved chunks explicitly describe a different product, jurisdiction, or entity tier."
     )
     FLAG_RET_NOISY_OR_IRRELEVANT: bool = Field(
-        ..., description="Retrieved chunks are completely off-topic or noisy."
+        default=False, description="Retrieved chunks are completely off-topic or noisy."
     )
 
     # Layer 3: Response Structural Type (Mutually Exclusive Shapes)
     FLAG_RESP_SHAPE_DIRECT_STATEMENT: bool = Field(
-        ..., description="Primary structure asserts factual or policy rules directly."
+        default=False, description="Primary structure asserts factual or policy rules directly."
     )
     FLAG_RESP_SHAPE_CONDITIONAL_STATEMENT: bool = Field(
-        ..., description="Primary structure provides structured If/Then scenario logic."
+        default=False, description="Primary structure provides structured If/Then scenario logic."
     )
     FLAG_RESP_SHAPE_ASKBACK: bool = Field(
-        ..., description="Primary structure contains a question or clarification directed at the user (Prioritize True if a follow-up question is present)."
+        default=False, description="Primary structure contains a question or clarification directed at the user (Prioritize True if a follow-up question is present)."
     )
     FLAG_RESP_SHAPE_BOUNDARY_DECLARATION: bool = Field(
-        ..., description="Primary structure explicitly states policy info is missing, unconfirmed, or outside knowledge limits."
+        default=False, description="Primary structure explicitly states policy info is missing, unconfirmed, or outside knowledge limits."
     )
     FLAG_RESP_SHAPE_REFUSAL: bool = Field(
-        ..., description="Primary structure refuses request due to safety, compliance, or scope policy."
+        default=False, description="Primary structure refuses request due to safety, compliance, or scope policy."
     )
 
     # Layer 4: Deep Response Execution & Grounding
     FLAG_EXEC_UNSUPPORTED_ASSERTION: bool = Field(
-        ..., description="Response contains factual/policy claim unsupported by retrieved chunks (hallucination)."
+        default=False, description="Response contains factual/policy claim unsupported by retrieved chunks (hallucination)."
     )
     FLAG_EXEC_MISAPPLIED_LOGIC: bool = Field(
-        ..., description="Assistant read valid chunks but inverted, miscalculated, or misapplied policy rules."
+        default=False, description="Assistant read valid chunks but inverted, miscalculated, or misapplied policy rules."
     )
     FLAG_EXEC_INCOMPLETE_ANSWER: bool = Field(
-        ..., description="Assistant omitted available evidence from response without declaring a boundary."
+        default=False, description="Assistant omitted available evidence from response without declaring a boundary."
     )
     FLAG_ASK_REQUIRED_BY_POLICY: bool = Field(
-        ..., description="Ask-back strictly required because policy prohibits answering without missing variable."
+        default=False, description="Ask-back strictly required because policy prohibits answering without missing variable."
     )
     FLAG_ASK_VIABLE_WITHOUT_QUESTION: bool = Field(
-        ..., description="Query was fully resolvable conditionally without stopping to ask a question."
+        default=False, description="Query was fully resolvable conditionally without stopping to ask a question."
     )
     FLAG_ASK_ALL_PARTS_RELEVANT: bool = Field(
-        ..., description="In a multi-part ask-back, every sub-question is strictly necessary and relevant."
+        default=False, description="In a multi-part ask-back, every sub-question is strictly necessary and relevant."
     )
     FLAG_ASK_HAS_REDUNDANT_PART: bool = Field(
-        ..., description="At least one sub-question in ask-back is redundant, trivial, or previously answered."
+        default=False, description="At least one sub-question in ask-back is redundant, trivial, or previously answered."
     )
     FLAG_ASK_HAS_RELEVANT_PART: bool = Field(
-        ..., description="At least one sub-question in ask-back is valid, necessary, and helpful."
+        default=False, description="At least one sub-question in ask-back is valid, necessary, and helpful."
     )
     FLAG_BOUND_ACCURATE_TO_RETRIEVAL: bool = Field(
-        ..., description="Accurately declared missing data when retrieval was actually empty or partial."
+        default=False, description="Accurately declared missing data when retrieval was actually empty or partial."
     )
     FLAG_BOUND_FALSE_DECLARATION: bool = Field(
-        ..., description="Claimed data was missing when full evidence was actually present in chunks."
+        default=False, description="Claimed data was missing when full evidence was actually present in chunks."
     )
     FLAG_REFUSAL_EXCESSIVE: bool = Field(
-        ..., description="False-positive safety refusal on a legitimate bank policy query."
+        default=False, description="False-positive safety refusal on a legitimate bank policy query."
     )
     FLAG_ALT_OFFERED: bool = Field(
-        ..., description="Provided a safe alternative path or next step."
+        default=False, description="Provided a safe alternative path or next step."
     )
     FLAG_ALT_INCOMPLETE_OR_BROKEN: bool = Field(
-        ..., description="Provided an incomplete, broken, or misleading alternative path."
+        default=False, description="Provided an incomplete, broken, or misleading alternative path."
     )
     FLAG_QUAL_COMMUNICATION_POOR: bool = Field(
-        ..., description="Poor formatting, excessive verbosity, or ambiguous phrasing."
+        default=False, description="Poor formatting, excessive verbosity, or ambiguous phrasing."
     )
 
     # Layer 5: Input Query Complexity
     FLAG_QUERY_UNDER_SPECIFIED: bool = Field(
-        ..., description="User query lacks necessary variables required to yield a single specific answer."
+        default=False, description="User query lacks necessary variables required to yield a single specific answer."
     )
     FLAG_QUERY_MULTI_INTENT: bool = Field(
-        ..., description="User query contains multiple independent policy questions in a single turn."
+        default=False, description="User query contains multiple independent policy questions in a single turn."
     )
     FLAG_QUERY_OUT_OF_SCOPE: bool = Field(
-        ..., description="User query is non-banking or outside policy domain."
+        default=False, description="User query is non-banking or outside policy domain."
     )
 
     @field_validator("*", mode="before")
@@ -149,6 +149,34 @@ class AtomicAuditFlags(BaseModel):
             if cleaned in ("false", "0", "no"):
                 return False
         return v
+
+
+# ==========================================
+# DICTIONARY SANITIZER (Unwraps & Coerces)
+# ==========================================
+def sanitize_atomic_dict(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    
+    for wrapper_key in ["flags", "matrix", "result", "properties", "data", "audit_output"]:
+        if wrapper_key in data and isinstance(data[wrapper_key], dict):
+            data = data[wrapper_key]
+            break
+            
+    sanitized = {}
+    for k, v in data.items():
+        if isinstance(v, str):
+            clean_v = v.strip().lower()
+            if clean_v in ("true", "1", "yes"):
+                sanitized[k] = True
+            elif clean_v in ("false", "0", "no"):
+                sanitized[k] = False
+            else:
+                sanitized[k] = v
+        else:
+            sanitized[k] = v
+            
+    return sanitized
 
 
 # ==========================================
@@ -182,7 +210,6 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
     audit_rationale = flags_dict.get("audit_rationale", "No rationale provided.")
     notes: List[str] = []
 
-    # Sanity Gate: Mutually Exclusive Response Shapes
     shape_flags = [
         "FLAG_RESP_SHAPE_DIRECT_STATEMENT",
         "FLAG_RESP_SHAPE_CONDITIONAL_STATEMENT",
@@ -203,7 +230,7 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
             atomic_flags_dict=flags_dict
         )
 
-    # Tier 1: Ask-Back Priority (Benefit-of-the-Doubt Rule)
+    # Tier 1: Ask-Back Priority
     if flags_dict.get("FLAG_RESP_SHAPE_ASKBACK", False):
         if (
             flags_dict.get("FLAG_ASK_HAS_RELEVANT_PART", False) or 
@@ -355,9 +382,10 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
 
 
 # ==========================================
-# DATABRICKS CLIENT & ASYNC API WRAPPER
+# DATABRICKS OPENAI-COMPATIBLE API CLIENT
 # ==========================================
 w = WorkspaceClient()
+openai_client = w.serving_endpoints.get_open_ai_client()
 
 @retry(
     wait=wait_random_exponential(min=1, max=60),
@@ -368,24 +396,19 @@ async def call_databricks_serving_api(prompt_text: str) -> str:
     loop = asyncio.get_running_loop()
     
     def _sync_call():
-        return w.serving_endpoints.query(
-            name=SERVING_ENDPOINT_NAME,
+        response = openai_client.chat.completions.create(
+            model=SERVING_ENDPOINT_NAME,
             messages=[
                 {"role": "system", "content": ATOMIC_AUDITOR_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt_text}
             ],
             temperature=0.0,
-            max_tokens=2500
+            max_tokens=2500,
+            response_format={"type": "json_object"}
         )
-    
-    response = await loop.run_in_executor(None, _sync_call)
-    
-    if hasattr(response, 'choices') and len(response.choices) > 0:
         return response.choices[0].message.content
-    elif isinstance(response, dict) and 'choices' in response:
-        return response['choices'][0]['message']['content']
-    else:
-        raise ValueError(f"Unexpected Databricks response structure: {response}")
+    
+    return await loop.run_in_executor(None, _sync_call)
 
 
 # ==========================================
@@ -428,8 +451,8 @@ async def evaluate_single_transaction(
             repaired_str = repair_json(raw_response)
             parsed = json.loads(repaired_str)
 
-            # Pydantic v2 validation and model_dump()
-            atomic_obj = AtomicAuditFlags(**parsed)
+            cleaned_parsed = sanitize_atomic_dict(parsed)
+            atomic_obj = AtomicAuditFlags(**cleaned_parsed)
             flags_dict = atomic_obj.model_dump()
             
             verdict = route_audit_flags(flags_dict)
@@ -460,7 +483,7 @@ async def evaluate_single_transaction(
                 "primary_failure_theme": "AUDIT_FAILURE",
                 "is_defect": True,
                 "audit_rationale": None,
-                "audit_notes": str(e),
+                "audit_notes": f"Error: {str(e)}",
                 "audit_status": "FAILED",
                 "error_message": str(e)
             }
@@ -484,7 +507,6 @@ async def run_audit_pipeline():
     logger.info("Building secure chronological conversation history maps iteratively...")
     history_lookup: Dict[str, List[Dict[str, str]]] = {}
     
-    # Iterate conversation groups in natural input order without sorting
     for conv_id, group in df.groupby('conversation_id', sort=False):
         conversation_history = []
         for _, r in group.iterrows():
