@@ -229,7 +229,45 @@ Analyze the preceding conversation history, retrieved document chunks, and assis
 - `FLAG_QUERY_UNDER_SPECIFIED`: Set True if user query lacks necessary variables required to yield a single specific answer.
 - `FLAG_QUERY_MULTI_INTENT`: Set True if user query contains multiple independent policy questions in a single turn.
 - `FLAG_QUERY_OUT_OF_SCOPE`: Set True if user query is non-banking or outside policy domain.
-"""
+
+### OUTPUT FORMAT:
+You must output a single valid JSON object containing **exact key names** matching the schema fields:
+```json
+{
+  "step1_contextualized_request": "string",
+  "audit_rationale": "string",
+  "FLAG_HIST_HAS_EXPLICIT_CONSTRAINTS": false,
+  "FLAG_HIST_CONSTRAINTS_CONTRADICTED": false,
+  "FLAG_HIST_CONSTRAINTS_REREQUESTED": false,
+  "FLAG_HIST_CONTEXT_FULLY_PRESERVED": false,
+  "FLAG_RET_CHUNK_COUNT_ZERO": false,
+  "FLAG_RET_CONTAINS_FULL_ANSWER": false,
+  "FLAG_RET_CONTAINS_PARTIAL_ANSWER": false,
+  "FLAG_RET_WRONG_ENTITY_OR_SCOPE": false,
+  "FLAG_RET_NOISY_OR_IRRELEVANT": false,
+  "FLAG_RESP_SHAPE_DIRECT_STATEMENT": false,
+  "FLAG_RESP_SHAPE_CONDITIONAL_STATEMENT": false,
+  "FLAG_RESP_SHAPE_ASKBACK": false,
+  "FLAG_RESP_SHAPE_BOUNDARY_DECLARATION": false,
+  "FLAG_RESP_SHAPE_REFUSAL": false,
+  "FLAG_EXEC_UNSUPPORTED_ASSERTION": false,
+  "FLAG_EXEC_MISAPPLIED_LOGIC": false,
+  "FLAG_EXEC_INCOMPLETE_ANSWER": false,
+  "FLAG_ASK_REQUIRED_BY_POLICY": false,
+  "FLAG_ASK_VIABLE_WITHOUT_QUESTION": false,
+  "FLAG_ASK_ALL_PARTS_RELEVANT": false,
+  "FLAG_ASK_HAS_REDUNDANT_PART": false,
+  "FLAG_ASK_HAS_RELEVANT_PART": false,
+  "FLAG_BOUND_ACCURATE_TO_RETRIEVAL": false,
+  "FLAG_BOUND_FALSE_DECLARATION": false,
+  "FLAG_REFUSAL_EXCESSIVE": false,
+  "FLAG_ALT_OFFERED": false,
+  "FLAG_ALT_INCOMPLETE_OR_BROKEN": false,
+  "FLAG_QUAL_COMMUNICATION_POOR": false,
+  "FLAG_QUERY_UNDER_SPECIFIED": false,
+  "FLAG_QUERY_MULTI_INTENT": false,
+  "FLAG_QUERY_OUT_OF_SCOPE": false
+}
 
 
 # ==========================================
