@@ -152,7 +152,7 @@ class AtomicAuditFlags(BaseModel):
 
 
 # ==========================================
-# DICTIONARY SANITIZER (Unwraps & Coerces)
+# DICTIONARY SANITIZER
 # ==========================================
 def sanitize_atomic_dict(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict):
@@ -180,16 +180,55 @@ def sanitize_atomic_dict(data: Any) -> Dict[str, Any]:
 
 
 # ==========================================
-# PHASE 1 SYSTEM PROMPT
+# PHASE 1 SYSTEM PROMPT (Per-Flag Explicit Rubric)
 # ==========================================
 ATOMIC_AUDITOR_SYSTEM_PROMPT = """You are an objective, mathematical audit sensor for an enterprise RAG assistant serving bank policy queries.
-Your task is to analyze the preceding conversation history, retrieved document chunks, and latest assistant response, and output a JSON object adhering to the specified schema.
+Analyze the preceding conversation history, retrieved document chunks, and assistant response. You MUST evaluate each flag individually based on the following explicit activation rules. Do not default all flags to false.
 
-### Execution Instructions:
-1. **Step 1 Intent Synthesis:** First, synthesize conversation memory and the immediate user request into a clean, standalone operational query (`step1_contextualized_request`).
-2. **Rationale Draft:** Draft a thorough `audit_rationale` explaining factual observations across memory, retrieval, response shape, and execution.
-3. **Atomic Measurement:** Act strictly as an independent binary sensor for the 27 boolean flags.
-4. **Shape Rule:** Select EXACTLY ONE response shape flag (`FLAG_RESP_SHAPE_*`). Prioritize `FLAG_RESP_SHAPE_ASKBACK` if a follow-up question is present alongside statements.
+### STEP 1: INTENT SYNTHESIS & RATIONALE
+- `step1_contextualized_request`: Write a clean, standalone operational query synthesizing prior history and the current request.
+- `audit_rationale`: Provide a step-by-step breakdown explaining observations across memory, retrieval, response shape, and execution before assigning flags.
+
+### STEP 2: CONVERSATION MEMORY FLAGS (FLAG_HIST_*)
+- `FLAG_HIST_HAS_EXPLICIT_CONSTRAINTS`: Set True if preceding turns contain explicit user constraints (e.g., account tier, jurisdiction, entity type, specific limits).
+- `FLAG_HIST_CONSTRAINTS_CONTRADICTED`: Set True if the assistant unprompted contradicts an active, unrevoked constraint established in preceding history.
+- `FLAG_HIST_CONSTRAINTS_REREQUESTED`: Set True if the assistant asks for a parameter or constraint that was already explicitly provided in preceding turns.
+- `FLAG_HIST_CONTEXT_FULLY_PRESERVED`: Set True if the assistant seamlessly preserves all historical parameters from preceding turns without loss.
+
+### STEP 3: RETRIEVAL & GROUNDING FLAGS (FLAG_RET_*)
+- `FLAG_RET_CHUNK_COUNT_ZERO`: Set True if zero document chunks are returned by the retriever.
+- `FLAG_RET_CONTAINS_FULL_ANSWER`: Set True if retrieved chunks contain complete, explicit policy text needed to satisfy request.
+- `FLAG_RET_CONTAINS_PARTIAL_ANSWER`: Set True if retrieved chunks cover only a fraction of the request, leaving key clauses or limits missing.
+- `FLAG_RET_WRONG_ENTITY_OR_SCOPE`: Set True if retrieved chunks explicitly describe a different product, jurisdiction, or entity tier.
+- `FLAG_RET_NOISY_OR_IRRELEVANT`: Set True if retrieved chunks are completely off-topic or noisy.
+
+### STEP 4: RESPONSE SHAPE FLAGS (FLAG_RESP_SHAPE_*) - MUTUALLY EXCLUSIVE (SELECT EXACTLY ONE)
+- `FLAG_RESP_SHAPE_DIRECT_STATEMENT`: Set True ONLY if primary structure asserts factual or policy rules directly.
+- `FLAG_RESP_SHAPE_CONDITIONAL_STATEMENT`: Set True ONLY if primary structure provides structured If/Then scenario logic.
+- `FLAG_RESP_SHAPE_ASKBACK`: Set True IF the assistant responds with a question, clarification request, or ends with a question mark directed at the user.
+- `FLAG_RESP_SHAPE_BOUNDARY_DECLARATION`: Set True ONLY if primary structure explicitly states policy info is missing, unconfirmed, or outside knowledge limits.
+- `FLAG_RESP_SHAPE_REFUSAL`: Set True ONLY if primary structure refuses request due to safety, compliance, or scope policy.
+
+### STEP 5: EXECUTION, ASK-BACK, & BOUNDARY FLAGS
+- `FLAG_EXEC_UNSUPPORTED_ASSERTION`: Set True if response contains factual/policy claims unsupported by retrieved chunks (hallucination).
+- `FLAG_EXEC_MISAPPLIED_LOGIC`: Set True if assistant read valid chunks but inverted, miscalculated, or misapplied policy rules.
+- `FLAG_EXEC_INCOMPLETE_ANSWER`: Set True if assistant omitted available evidence from response without declaring a boundary.
+- `FLAG_ASK_REQUIRED_BY_POLICY`: Set True if policy strictly prohibits answering without the missing variable requested in the ask-back.
+- `FLAG_ASK_VIABLE_WITHOUT_QUESTION`: Set True if query was fully resolvable conditionally without stopping to ask a question.
+- `FLAG_ASK_ALL_PARTS_RELEVANT`: Set True if every sub-question in a multi-part ask-back is strictly necessary.
+- `FLAG_ASK_HAS_REDUNDANT_PART`: Set True if at least one sub-question in the ask-back is redundant, trivial, or previously answered in history.
+- `FLAG_ASK_HAS_RELEVANT_PART`: Set True if at least one sub-question in the ask-back is valid, necessary, and helpful.
+- `FLAG_BOUND_ACCURATE_TO_RETRIEVAL`: Set True if missing data was accurately declared when retrieval was empty or partial.
+- `FLAG_BOUND_FALSE_DECLARATION`: Set True if claimed data was missing when full evidence was actually present in chunks.
+- `FLAG_REFUSAL_EXCESSIVE`: Set True for false-positive safety refusals on legitimate bank policy queries.
+- `FLAG_ALT_OFFERED`: Set True if a safe alternative path or next step was provided.
+- `FLAG_ALT_INCOMPLETE_OR_BROKEN`: Set True if provided alternative path was incomplete, broken, or misleading.
+- `FLAG_QUAL_COMMUNICATION_POOR`: Set True for poor formatting, excessive verbosity, or ambiguous phrasing.
+
+### STEP 6: INPUT QUERY COMPLEXITY FLAGS (FLAG_QUERY_*)
+- `FLAG_QUERY_UNDER_SPECIFIED`: Set True if user query lacks necessary variables required to yield a single specific answer.
+- `FLAG_QUERY_MULTI_INTENT`: Set True if user query contains multiple independent policy questions in a single turn.
+- `FLAG_QUERY_OUT_OF_SCOPE`: Set True if user query is non-banking or outside policy domain.
 """
 
 
@@ -232,41 +271,29 @@ def route_audit_flags(flags_dict: Dict[str, Any]) -> AuditVerdict:
 
     # Tier 1: Ask-Back Priority
     if flags_dict.get("FLAG_RESP_SHAPE_ASKBACK", False):
-        if (
-            flags_dict.get("FLAG_ASK_HAS_RELEVANT_PART", False) or 
-            flags_dict.get("FLAG_ASK_REQUIRED_BY_POLICY", False) or 
-            flags_dict.get("FLAG_QUERY_UNDER_SPECIFIED", False)
-        ):
-            return AuditVerdict(
-                primary_failure_theme="EXPECTED_BEHAVIOR",
-                is_defect=False,
-                step1_contextualized_request=intent_req,
-                audit_rationale=audit_rationale,
-                audit_notes=["Tier 1: Valid Ask-Back / Clarification Requested."],
-                atomic_flags_dict=flags_dict
-            )
-        
-        if (
+        is_unnecessary = (
             flags_dict.get("FLAG_HIST_CONSTRAINTS_REREQUESTED", False) or 
             flags_dict.get("FLAG_HIST_CONSTRAINTS_CONTRADICTED", False) or
             flags_dict.get("FLAG_ASK_HAS_REDUNDANT_PART", False) or
             (flags_dict.get("FLAG_ASK_VIABLE_WITHOUT_QUESTION", False) and not flags_dict.get("FLAG_ASK_REQUIRED_BY_POLICY", False))
-        ):
+        )
+        
+        if is_unnecessary:
             return AuditVerdict(
                 primary_failure_theme="UNNECESSARY_CLARIFICATION",
                 is_defect=True,
                 step1_contextualized_request=intent_req,
                 audit_rationale=audit_rationale,
-                audit_notes=["Tier 1: Unnecessary / Redundant Ask-Back."],
+                audit_notes=["Tier 1: Explicitly redundant or invalid Ask-Back detected."],
                 atomic_flags_dict=flags_dict
             )
-        
+            
         return AuditVerdict(
-            primary_failure_theme="UNNECESSARY_CLARIFICATION",
-            is_defect=True,
+            primary_failure_theme="EXPECTED_BEHAVIOR",
+            is_defect=False,
             step1_contextualized_request=intent_req,
             audit_rationale=audit_rationale,
-            audit_notes=["Tier 1: Unmapped Ask-Back fallback."],
+            audit_notes=["Tier 1: Valid Ask-Back / Clarification."],
             atomic_flags_dict=flags_dict
         )
 
