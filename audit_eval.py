@@ -41,16 +41,29 @@ LLM_ENDPOINT = "<your-databricks-serving-endpoint>"
 
 # List every policy title / section so scope judgments use the actual corpus,
 # not topic feel. Leave empty only if you have no index yet.
-CORPUS_INDEX = [
-    # "Leave Policy",
-    # "Expense Policy",
-    # "Separation Policy",
-    # "CFCR Regulatory Change Policy",
-    # "Wolfsberg Group Standards",
-    # "Enterprise Risk Management Framework",
-    # "Operational Risk Policy",
-    # "Market Risk Capital Policy",
-]
+# Path to a plain text file with one policy title per line.
+# With 303 documents this is cleaner than an inline list.
+CORPUS_INDEX_PATH = "/Volumes/<catalog>/<schema>/<volume>/corpus_index.txt"
+
+# How many top-matching corpus titles to send to the judge per request.
+# 15 keeps the prompt short while covering the most relevant candidates.
+CORPUS_TOP_N = 15
+
+# How many candidate missing documents to surface when AUDIT_INPUT_LIMITED fires.
+CORPUS_GAP_TOP_N = 5
+
+def _load_corpus(path):
+    try:
+        with open(path) as fh:
+            titles = [l.strip() for l in fh if l.strip()]
+        print(f"loaded {len(titles)} corpus titles from {path}")
+        return titles
+    except FileNotFoundError:
+        print(f"WARNING: corpus index not found at {path}. "
+              f"Scope judgments will rely on topic feel only.")
+        return []
+
+CORPUS_INDEX = _load_corpus(CORPUS_INDEX_PATH)
 
 # Product decision: should "adjacent" (HR-flavoured, no policy covers it) be in scope?
 ADJACENT_IS_IN_SCOPE = False
@@ -186,6 +199,67 @@ def _make_llm(endpoint):
 llm = _make_llm(LLM_ENDPOINT)
 _max_tokens_in_constructor = (
     "max_tokens" in inspect.signature(ChatDatabricks.__init__).parameters)
+
+# --------------------------------------------------------------------------
+# CORPUS VECTORIZER  — built once at startup
+# Used for (1) scope: top-N titles sent to judge
+#          (2) gap:   titles that scored high but were not retrieved
+# --------------------------------------------------------------------------
+_corpus_vec    = None
+_corpus_matrix = None
+
+
+def _build_corpus_index(titles):
+    global _corpus_vec, _corpus_matrix
+    if not titles:
+        return
+    _corpus_vec    = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 5), min_df=1)
+    _corpus_matrix = _corpus_vec.fit_transform(
+        [norm(t) for t in titles])
+    print(f"corpus vectorizer ready ({_corpus_matrix.shape[0]} titles)")
+
+
+def _corpus_scores(request_text):
+    """Similarity scores of request against every corpus title."""
+    if _corpus_vec is None or not CORPUS_INDEX:
+        return None, []
+    q   = _corpus_vec.transform([norm(request_text)])
+    sim = (q @ _corpus_matrix.T).toarray().ravel()
+    return sim, sim.argsort()[::-1]
+
+
+def top_corpus_titles(request_text, n=None):
+    """Top-N corpus titles most similar to the request (for the judge prompt)."""
+    n   = n or CORPUS_TOP_N
+    sim, order = _corpus_scores(request_text)
+    if order is None or len(order) == 0:
+        return CORPUS_INDEX[:n]
+    return [CORPUS_INDEX[i] for i in order[:n]]
+
+
+def find_missing_documents(request_text, retrieved_titles, n=None):
+    """Corpus titles that score high for this request but were NOT retrieved.
+
+    Called only when AUDIT_INPUT_LIMITED=TRUE so cost is bounded.
+    retrieved_titles: list of doc_title strings from the agent's chunks.
+    Returns list of {"title": ..., "score": ...} dicts, best first.
+    """
+    n = n or CORPUS_GAP_TOP_N
+    if _corpus_vec is None or not CORPUS_INDEX:
+        return []
+    retrieved_norm = {norm(t) for t in retrieved_titles if t and t != "?"}
+    sim, order     = _corpus_scores(request_text)
+    out = []
+    for i in order:
+        if len(out) >= n:
+            break
+        title = CORPUS_INDEX[i]
+        if norm(title) not in retrieved_norm and sim[i] > 0.05:
+            out.append({"title": title,
+                        "score": round(float(sim[i]), 3)})
+    return out
+
 
 # COMMAND ----------
 # --------------------------------------------------------------------------
@@ -369,6 +443,10 @@ ROUTE_IN_LOG = False
 
 def norm(s):
     return " ".join(re.sub(r"[^\w\s?']", " ", str(s).lower()).split())
+
+
+# build corpus vectorizer now that norm() is available
+_build_corpus_index(CORPUS_INDEX)
 
 
 def b(x):
@@ -561,8 +639,11 @@ def tag_static(df):
 # --------------------------------------------------------------------------
 def render(name, c):
     if name == "corpus":
-        return "## POLICY CORPUS INDEX\n" + (
-            "\n".join(f"- {x}" for x in CORPUS_INDEX) or "(not provided)")
+        titles = top_corpus_titles(c["request"])
+        note   = (f" (top {len(titles)} of {len(CORPUS_INDEX)} by relevance)"
+                  if len(CORPUS_INDEX) > CORPUS_TOP_N else "")
+        return "## POLICY CORPUS INDEX" + note + "\n" + (
+            "\n".join(f"- {x}" for x in titles) or "(not provided)")
     if name == "history":
         return "## CONVERSATION HISTORY (earlier turns only)\n" + (
             "\n".join(f"{m['role']}: {m['content']}"
@@ -1166,6 +1247,13 @@ def finish(st):
     v      = verdict(f, issues, st["errors"], themes)
     row, c = st["row"], st["ctx"]
 
+    # missing document identification: only when inputs were flagged as limited
+    missing_docs = []
+    if f.get("AUDIT_INPUT_LIMITED") == TRUE:
+        retrieved_titles = [ch["doc_title"] for ch in c["chunks"]]
+        missing_docs     = find_missing_documents(
+            row["request"], retrieved_titles)
+
     out = {
         "transaction_id":     row["transaction_id"],
         "conversation_id":    row["conversation_id"],
@@ -1183,6 +1271,11 @@ def finish(st):
         "cause_owner":        CAUSE_OWNER.get(
                                   (cause or {}).get("cause"), ""),
         "gap_type":           gap,
+        # candidate documents that should have been retrieved (populated when
+        # AUDIT_INPUT_LIMITED=TRUE; empty list means corpus had no strong candidates
+        # or corpus index was not provided)
+        "missing_documents":        json.dumps(missing_docs, ensure_ascii=False),
+        "missing_document_titles":  "; ".join(d["title"] for d in missing_docs),
         "needs_review":       v["needs_review"],
         "tier":               v["tier"],
         "soft_flags":         "; ".join(v["soft_flags"]),
