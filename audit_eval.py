@@ -15,7 +15,7 @@
 # All static responses are treated as dead ends (NEXT_STEP_PROVIDED=FALSE).
 
 # COMMAND ----------
-# MAGIC %pip install -q langchain-databricks scikit-learn
+# MAGIC %pip install -q databricks-langchain scikit-learn
 # COMMAND ----------
 # dbutils.library.restartPython()
 
@@ -28,7 +28,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-from langchain_databricks import ChatDatabricks
+# Package name differs by version: databricks-langchain is the current one,
+# langchain-databricks is the older name. Try both.
+try:
+    from databricks_langchain import ChatDatabricks
+except ImportError:
+    from langchain_databricks import ChatDatabricks
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -199,6 +204,35 @@ def _make_llm(endpoint):
 llm = _make_llm(LLM_ENDPOINT)
 _max_tokens_in_constructor = (
     "max_tokens" in inspect.signature(ChatDatabricks.__init__).parameters)
+
+
+def smoke_test_llm():
+    """Fail loudly at startup if the endpoint is unreachable.
+
+    Without this a broken endpoint silently turns every flag into UNKNOWN
+    and every row into 'needs review', which looks like a 100% failure rate
+    rather than a configuration problem.
+    """
+    probe = ('Return JSON only, nothing else: '
+             '{"PROBE": {"evidence": "ok", "decision": "TRUE"}}')
+    try:
+        raw = str(llm.invoke(probe).content)
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM endpoint '{LLM_ENDPOINT}' is not reachable: "
+            f"{type(e).__name__}: {e}\n"
+            f"Fix this before running the audit — otherwise every flag "
+            f"becomes UNKNOWN and every row is flagged for review."
+        ) from e
+    if not re.search(r"\{.*\}", raw, re.S):
+        raise RuntimeError(
+            f"LLM endpoint '{LLM_ENDPOINT}' responded but returned no JSON.\n"
+            f"Raw reply: {raw[:300]!r}\n"
+            f"Check the model supports JSON output and max_tokens is high enough.")
+    print(f"LLM endpoint OK: {LLM_ENDPOINT}")
+
+
+smoke_test_llm()
 
 # --------------------------------------------------------------------------
 # CORPUS VECTORIZER  — built once at startup
@@ -1314,6 +1348,19 @@ def run_audit(path):
 
     n    = int(result["needs_review"].sum())
     tiers = result["tier"].value_counts()
+
+    # warn loudly if judge calls are failing — this is the #1 cause of a
+    # 100% review rate and it is easy to mistake for a genuine finding
+    err_rate = (result["errors"].fillna("") != "").mean()
+    if err_rate > 0.1:
+        print(f"\n*** WARNING: {err_rate:.0%} of rows had audit errors. ***")
+        print("Flags defaulted to UNKNOWN, so the review rate below is "
+              "NOT a real finding. Sample errors:")
+        for e in result.loc[result["errors"].fillna("") != "",
+                            "errors"].head(3):
+            print(f"  - {e[:200]}")
+        print()
+
     print(f"\naudited {len(result)} rows — {n} need review "
           f"({n / max(len(result), 1):.0%})")
     print("tier breakdown:\n", tiers.to_string())
