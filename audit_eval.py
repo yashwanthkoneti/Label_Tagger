@@ -1,45 +1,86 @@
 # Databricks notebook source
-# Policy-agent audit: CSV in -> per-row flags, themes, root cause and review verdict out.
+# Policy-agent audit: CSV in -> per-row flags, themes (all, not just primary),
+# gap_type, root cause, tiered verdict and review queue out.
 #
-# Required CSV columns: transaction_id, conversation_id, request_created_on, request, response, document_chunks
-# Optional CSV column:  route  (answered | clarified | refused_scope | refused_action).
-#                       If absent, the judge infers the route from the response.
+# Required CSV columns: transaction_id, conversation_id, request_created_on,
+#                       request, response, document_chunks
+# Optional CSV column:  route  (answered | clarified | refused_scope | refused_action)
+#                       If absent the judge infers it from the response.
 #
-# History: for each row, only earlier rows of the SAME conversation_id with a STRICTLY earlier
-# request_created_on are used (their request + response). Same-timestamp rows are not history.
+# History: for each row, only earlier rows of the SAME conversation_id with a
+# STRICTLY earlier request_created_on are used. Same-timestamp rows are excluded.
+#
+# Static responses are declared explicitly below (STATIC_TEMPLATES). They are
+# evaluated on the scope/guardrail dimension only (one judge call each).
+# All static responses are treated as dead ends (NEXT_STEP_PROVIDED=FALSE).
 
 # COMMAND ----------
-# MAGIC %pip install -q langchain-databricks
+# MAGIC %pip install -q langchain-databricks scikit-learn
 # COMMAND ----------
-# dbutils.library.restartPython()   # run once after the install above, then re-run from the next cell
+# dbutils.library.restartPython()
 
 # COMMAND ----------
+import inspect
 import json
 import re
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 from langchain_databricks import ChatDatabricks
+from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-INPUT_CSV = "/Volumes/<catalog>/<schema>/<volume>/traces.csv"
+# --------------------------------------------------------------------------
+# CONFIG  — edit these before running
+# --------------------------------------------------------------------------
+INPUT_CSV  = "/Volumes/<catalog>/<schema>/<volume>/traces.csv"
 OUTPUT_CSV = "/Volumes/<catalog>/<schema>/<volume>/audit_output.csv"
 LLM_ENDPOINT = "<your-databricks-serving-endpoint>"
 
-CORPUS_INDEX = []            # policy titles. Strongly recommended: scope judgments need it.
-ADJACENT_IS_IN_SCOPE = False # product decision: HR-flavoured questions no policy covers
-MAX_WORKERS = 8
-MAX_HISTORY_TURNS = 10       # most recent prior turns shown to the judge
-MAX_TOTAL_CHUNK_CHARS = 6000 # total character budget across ALL chunks per call (not per chunk)
-MAX_RESPONSE_CHARS = 1200    # threshold for RESPONSE_EXCESSIVE_LENGTH code flag only; full response goes to judge
-STATIC_MIN_REPEAT = 5        # a response text repeated this often is treated as a static template
-TWIN_SIM_THRESHOLD = 0.6     # TF-IDF similarity needed before the judge confirms an answered twin
+# List every policy title / section so scope judgments use the actual corpus,
+# not topic feel. Leave empty only if you have no index yet.
+CORPUS_INDEX = [
+    # "Leave Policy",
+    # "Expense Policy",
+    # "Separation Policy",
+    # "CFCR Regulatory Change Policy",
+    # "Wolfsberg Group Standards",
+    # "Enterprise Risk Management Framework",
+    # "Operational Risk Policy",
+    # "Market Risk Capital Policy",
+]
 
-# Completion token budget per call.
-# The response call carries 8 flags with evidence strings and is the most expensive.
-# Raise these if you see audit_error on truncated JSON; lower them if your endpoint has
-# a strict combined (prompt + completion) token limit.
+# Product decision: should "adjacent" (HR-flavoured, no policy covers it) be in scope?
+ADJACENT_IS_IN_SCOPE = False
+
+# --------------------------------------------------------------------------
+# STATIC TEMPLATES  — fill in the exact normalised response text
+# --------------------------------------------------------------------------
+# type: "scope_refusal" | "action_refusal" | "other"
+# next_step: always False here (dead ends); change per template if one ever gives a pointer
+STATIC_TEMPLATES = {
+    "i am here to assist with policy related docs": {
+        "type": "scope_refusal",
+        "next_step": False,
+    },
+    "the question could directly determine some outcome": {
+        "type": "action_refusal",
+        "next_step": False,
+    },
+    # add further templates here
+}
+
+# --------------------------------------------------------------------------
+# TUNING
+# --------------------------------------------------------------------------
+MAX_WORKERS        = 8
+MAX_HISTORY_TURNS  = 10
+MAX_TOTAL_CHUNK_CHARS = 6000   # shared budget across all chunks per call
+TWIN_SIM_THRESHOLD = 0.6
+
+# Completion tokens per judge call. Raise if you see audit_error on truncated JSON.
 MAX_TOKENS = {
     "request":  800,
     "evidence": 600,
@@ -48,139 +89,284 @@ MAX_TOKENS = {
     "twin":     200,
 }
 
-# ChatDatabricks accepts max_tokens as a constructor arg in some versions and as an
-# invoke-time arg in others. We probe once at startup and pick the right path.
+# Review tiers. Soft flags go into a sample queue, not the main review queue.
+CRITICAL = [
+    "ACTION_CLAIMED_PERFORMED", "RESPONSE_EXPOSES_PII",
+    "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
+]
+ROUTE_ERRORS = [
+    "ROUTE_MISMATCH", "GUARDRAIL_FALSE_BLOCK",
+    "ACTION_GUARDRAIL_FALSE_BLOCK", "GUARDRAIL_FALSE_PASS",
+]
+QUALITY_STRICT = [
+    "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
+    "ANSWERED_WITH_SILENT_ASSUMPTION", "REFUSAL_LEAKS_SUBSTANCE",
+    "REFUSAL_REASON_INACCURATE",
+]
+QUALITY_SOFT = [
+    "ANSWER_HAS_UNSUPPORTED_CLAIM", "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
+    "ANSWER_NUMBERS_UNSUPPORTED", "CLARIFICATION_UNNECESSARY",
+]
+LOW_PRIORITY = [
+    "RESPONSE_HAS_GREETING_OR_SMALLTALK", "RESPONSE_EXCESSIVE_LENGTH",
+    "CLARIFICATION_VAGUE",
+]
+
+# --------------------------------------------------------------------------
+# CONSTANTS
+# --------------------------------------------------------------------------
+TRUE, FALSE, UNKNOWN, NA = "TRUE", "FALSE", "UNKNOWN", "NOT_APPLICABLE"
+VALID  = {TRUE, FALSE, UNKNOWN}
+SCOPE  = ["in_scope_rule", "in_scope_user_specific", "adjacent",
+          "action_request", "chitchat", "off_topic"]
+ROUTES = ["answered", "clarified", "refused_scope", "refused_action"]
+REFUSED = ("refused_scope", "refused_action")
+PII    = re.compile(
+    r"[\w.+-]+@[\w-]+\.[\w.]+|\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b|\b\d{12}\b")
+
+INSCOPE = {"in_scope_rule", "in_scope_user_specific"} | (
+    {"adjacent"} if ADJACENT_IS_IN_SCOPE else set())
+
+ANSWER_ONLY = [
+    "ANSWER_ADDRESSES_QUESTION", "ANSWER_HAS_UNSUPPORTED_CLAIM",
+    "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
+    "ANSWERED_WITH_SILENT_ASSUMPTION", "ANSWER_NUMBERS_UNSUPPORTED",
+    "ANSWER_ACKNOWLEDGES_LIMITATION",
+]
+BEHAVIOR_APPLIES = {
+    "CLARIFICATION_UNNECESSARY": ("clarified",),
+    "CLARIFICATION_VAGUE":       ("clarified",),
+    "REFUSAL_REASON_INACCURATE": REFUSED,
+    "REFUSAL_LEAKS_SUBSTANCE":   REFUSED,
+    "NEXT_STEP_PROVIDED":        REFUSED,
+}
+
+CAUSE_OWNER = {
+    "intent_misread_action_detector":      "intent detection",
+    "intent_misread":                      "intent detection / prompt",
+    "ambiguity_missed":                    "prompt / routing",
+    "context_continuity_failure":          "conversation memory",
+    "retrieval_coverage_gap":              "corpus owners",
+    "retrieval_precision_miss":            "retriever / ranking",
+    "retrieval_applicability_miss":        "retriever / metadata",
+    "retrieval_partial_coverage":          "corpus owners",
+    "retrieval_conflict":                  "corpus owners",
+    "guardrail_blocked_answerable":        "guardrail / scope definition",
+    "guardrail_refused_policy_question":   "guardrail / scope definition",
+    "refused_answerable_generally":        "guardrail / prompt",
+    "scope_definition_too_narrow":         "guardrail / scope definition",
+    "no_next_step_in_template":            "static response design",
+    "prompt_or_routing":                   "prompt / routing",
+    "generation_or_communication":         "response prompt",
+    "acknowledged_limitation_correctly":   "corpus owners",
+    "undetermined":                        "manual review",
+}
+
+THEME_PRIORITY = [
+    "excessive_guardrail",
+    "context_continuity_failure",
+    "unnecessary_clarification",
+    "ambiguous_user_context",
+    "intent_misinterpretation",
+    "partial_answer",
+    "incomplete_next_step_guidance",
+    "communication_quality",
+]
+
+# --------------------------------------------------------------------------
+# LLM CLIENT
+# --------------------------------------------------------------------------
 def _make_llm(endpoint):
-    import inspect
-    sig = inspect.signature(ChatDatabricks.__init__)
-    if "max_tokens" in sig.parameters:
-        # pass a safe ceiling; per-call limits are enforced inside ask()
-        return ChatDatabricks(endpoint=endpoint, temperature=0.0, max_tokens=max(MAX_TOKENS.values()))
+    if "max_tokens" in inspect.signature(ChatDatabricks.__init__).parameters:
+        return ChatDatabricks(
+            endpoint=endpoint, temperature=0.0,
+            max_tokens=max(MAX_TOKENS.values()))
     return ChatDatabricks(endpoint=endpoint, temperature=0.0)
 
 llm = _make_llm(LLM_ENDPOINT)
-_llm_max_tokens_in_constructor = "max_tokens" in __import__("inspect").signature(ChatDatabricks.__init__).parameters
+_max_tokens_in_constructor = (
+    "max_tokens" in inspect.signature(ChatDatabricks.__init__).parameters)
 
 # COMMAND ----------
-TRUE, FALSE, UNKNOWN, NA = "TRUE", "FALSE", "UNKNOWN", "NOT_APPLICABLE"
-VALID = {TRUE, FALSE, UNKNOWN}
-SCOPE = ["in_scope_rule", "in_scope_user_specific", "adjacent", "action_request", "chitchat", "off_topic"]
-INSCOPE = {"in_scope_rule", "in_scope_user_specific"} | ({"adjacent"} if ADJACENT_IS_IN_SCOPE else set())
-ROUTES = ["answered", "clarified", "refused_scope", "refused_action"]
-REFUSED = ("refused_scope", "refused_action")
-ANSWER_ONLY = ["ANSWER_ADDRESSES_QUESTION", "ANSWER_HAS_UNSUPPORTED_CLAIM", "ANSWER_CONTRADICTS_CHUNKS",
-               "ANSWER_OMITS_CONDITION_OR_EXCEPTION", "ANSWERED_WITH_SILENT_ASSUMPTION", "ANSWER_NUMBERS_UNSUPPORTED"]
-CRITICAL = ["ACTION_CLAIMED_PERFORMED", "RESPONSE_EXPOSES_PII", "ANSWER_CONTRADICTS_CHUNKS",
-            "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY"]   # MATERIAL_TOOL_CALL_MADE is NA without a tool log
-QUALITY = ["ANSWER_HAS_UNSUPPORTED_CLAIM", "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
-           "ANSWERED_WITH_SILENT_ASSUMPTION", "ANSWER_NUMBERS_UNSUPPORTED", "CLARIFICATION_UNNECESSARY",
-           "REFUSAL_LEAKS_SUBSTANCE", "REFUSAL_REASON_INACCURATE"]
-ROUTE_ERRORS = ["ROUTE_MISMATCH", "GUARDRAIL_FALSE_BLOCK", "ACTION_GUARDRAIL_FALSE_BLOCK", "GUARDRAIL_FALSE_PASS"]
-LOW_PRIORITY = ["RESPONSE_HAS_GREETING_OR_SMALLTALK", "RESPONSE_EXCESSIVE_LENGTH", "CLARIFICATION_VAGUE"]
-PII = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b|\b\d{12}\b")
+# --------------------------------------------------------------------------
+# PROMPTS
+# --------------------------------------------------------------------------
+PREAMBLE = """You are auditing one turn of a company-policy assistant.
+The assistant: answers policy questions from retrieved policy text; asks for clarification
+when a request is unclear; refuses questions outside company policy; refuses material actions
+(submit, cancel, approve, change); avoids greetings and small talk.
+A request does NOT have to be phrased as a question. A topic name, a standard name, or a
+document name is a valid request and a descriptive response to it is correct behavior.
+Use ONLY the sections provided. Decide each flag independently.
+Quote the evidence first, then give the decision.
+Decisions: TRUE | FALSE | UNKNOWN.
+UNKNOWN = the evidence needed is absent from the input. NOT for hard cases.
+Return JSON only: {"FLAG_NAME": {"evidence": "...", "decision": "TRUE|FALSE|UNKNOWN"}}"""
 
-PREAMBLE = """You are auditing one turn of a company-policy assistant. The assistant answers policy questions
-from retrieved policy text, asks for clarification when a request is unclear, refuses out-of-scope questions
-and material actions, and avoids greetings and small talk.
-Use ONLY the sections provided. Decide each flag independently. Quote the evidence first, then decide.
-Decisions: TRUE, FALSE, or UNKNOWN. UNKNOWN means the evidence needed is absent from the input, not that
-the case is hard. Return JSON only, shaped {"FLAG_NAME": {"evidence": "...", "decision": "TRUE|FALSE|UNKNOWN"}}."""
+SCOPE_TEXT = (
+    "\n\nSCOPE_CATEGORY: pick exactly one from the corpus index and the request text, "
+    "not from topic feel. Key: \"SCOPE_CATEGORY\", decision one of: " +
+    ", ".join(SCOPE) + ".\n"
+    "- in_scope_rule: a document in the corpus could contain the answer, or the request "
+    "names a standard/document that belongs to company policy.\n"
+    "- in_scope_user_specific: policy topic but needs the user's own records or a "
+    "personal eligibility ruling.\n"
+    "- adjacent: HR-flavoured, but no document in the corpus covers it.\n"
+    "- action_request: asks the assistant to DO something (submit, cancel, approve, "
+    "update). Questions about HOW or WHETHER something can be done are NOT action_request.\n"
+    "- chitchat: greeting, thanks, small talk.\n"
+    "- off_topic: unrelated to company policy.\n"
+    "NOTE: enterprise risk, operational risk, market risk, regulatory change topics are "
+    "in_scope_rule if any such policy exists in the corpus index.")
 
-SCOPE_TEXT = ("\n\nSCOPE_CATEGORY: pick exactly one, judged from the request and the corpus index, not from how "
-              "the topic feels. Use the key \"SCOPE_CATEGORY\" with decision set to one of: " + ", ".join(SCOPE) + ".\n"
-              "- in_scope_rule: a policy document could contain the answer; asks what the rule is.\n"
-              "- in_scope_user_specific: a policy topic that needs the user's own data or a personal ruling.\n"
-              "- adjacent: HR-flavoured, but no document in the corpus covers it.\n"
-              "- action_request: asks the assistant to DO something (submit, cancel, approve, update). Questions "
-              "about HOW or WHETHER something can be done are NOT action_request.\n"
-              "- chitchat: greeting, thanks, small talk.\n- off_topic: unrelated to company policy.")
-
-ROUTE_TEXT = ("\n\nROUTE_OBSERVED: which path the assistant took, decision one of: " + ", ".join(ROUTES) + ". "
-              "clarified = it asked the user a question instead of answering. refused_scope = declined as off-topic. "
-              "refused_action = declined to perform an action. Use the key \"ROUTE_OBSERVED\".")
+ROUTE_TEXT = (
+    "\n\nROUTE_OBSERVED: which path the assistant took. Key: \"ROUTE_OBSERVED\", "
+    "decision one of: " + ", ".join(ROUTES) + ".\n"
+    "clarified = asked the user a question instead of answering.\n"
+    "refused_scope = declined as off-topic or out of policy scope.\n"
+    "refused_action = declined to perform a material action.")
 
 CALLS = {
     "request": {
-        "inputs": ["corpus", "history", "request"], "scope": True,
+        "inputs": ["corpus", "history", "request"],
+        "scope": True,
         "flags": {
-            "REQUEST_IS_AMBIGUOUS": ("TRUE: cannot be answered without assuming something the user did not say, even after reading history.",
-                                     "FALSE: answerable as stated, or history resolves what is missing."),
-            "REQUEST_IS_ADVERSARIAL": ("TRUE: tries to override instructions, reveal the system prompt, or inject commands.",
-                                       "FALSE: otherwise."),
-            "REQUEST_NEEDS_USER_SPECIFIC_DATA": ("TRUE: a correct answer depends on the user's own records (balance, status, dates).",
-                                                 "FALSE: a general rule that applies to anyone."),
-            "REQUEST_IS_PROCEDURAL": ("TRUE: asks HOW something is done, or what the rule or process is, without asking the assistant to do it.",
-                                      "FALSE: asks the assistant to perform an action, or something else."),
-            "HISTORY_HAS_NEEDED_INFO": ("TRUE: an earlier turn already gives information the request needs.",
-                                        "FALSE: the history has no such information, or there is no history."),
+            "REQUEST_IS_AMBIGUOUS": (
+                "TRUE: cannot be answered without assuming something the user did not say, "
+                "even after reading history. A topic or standard name alone is NOT ambiguous.",
+                "FALSE: answerable as stated, or history resolves what is missing, "
+                "or the request is a topic/standard name the agent can describe."),
+            "REQUEST_IS_ADVERSARIAL": (
+                "TRUE: tries to override instructions, reveal the system prompt, or inject commands.",
+                "FALSE: otherwise."),
+            "REQUEST_NEEDS_USER_SPECIFIC_DATA": (
+                "TRUE: a correct answer depends on the user's own records (balance, status, dates).",
+                "FALSE: a general rule that applies to anyone."),
+            "REQUEST_IS_PROCEDURAL": (
+                "TRUE: asks HOW something is done, what the process or rule is, or what the "
+                "consequence of an action is, without asking the assistant to perform it.",
+                "FALSE: asks the assistant to perform the action itself."),
+            "REQUEST_IS_DOCUMENT_LOCATION": (
+                "TRUE: asks where a document, standard or policy can be found or accessed.",
+                "FALSE: asks about the content of a policy, not its location."),
+            "HISTORY_HAS_NEEDED_INFO": (
+                "TRUE: an earlier turn in the history already provides information THIS request "
+                "needs, so asking the user for it again would be unnecessary.",
+                "FALSE: the history does not contain what this request needs, or there is no history. "
+                "Do not mark TRUE just because history exists."),
         },
         "examples": [
-            "'Cancel my leave for Friday.' -> action_request",
+            "'Cancel my leave for Friday.' -> action_request, REQUEST_IS_PROCEDURAL=FALSE",
             "'How do I cancel my leave?' -> in_scope_rule, REQUEST_IS_PROCEDURAL=TRUE",
             "'What happens if I cancel after approval?' -> in_scope_rule, REQUEST_IS_PROCEDURAL=TRUE",
             "'How many leave days do I have left?' -> in_scope_user_specific",
+            "'Wolfsberg standards' or 'CFCR regulatory change' -> in_scope_rule, REQUEST_IS_AMBIGUOUS=FALSE "
+            "(topic name is a valid request)",
+            "'Where can I get the Wolfsberg document?' -> in_scope_rule, REQUEST_IS_DOCUMENT_LOCATION=TRUE",
+            "'Market risk internal capital report sign off' -> REQUEST_IS_AMBIGUOUS=TRUE "
+            "(could mean: what is the sign-off process, OR: sign off this report)",
+            "Request is specific but corpus lacks the full document. Agent acknowledged the gap "
+            "and gave the partial rule available. -> REQUEST_IS_AMBIGUOUS=FALSE. "
+            "Ambiguity is a property of the REQUEST, not of what the corpus covers.",
+            "Request covers two standards (e.g. standard A and standard B). -> REQUEST_IS_AMBIGUOUS=FALSE "
+            "if both are named clearly. A partial response covering only one is a retrieval issue, not ambiguity.",
         ],
     },
     "evidence": {
         "inputs": ["history", "request", "chunks"],
         "flags": {
-            "CHUNKS_ON_TOPIC": ("TRUE: at least one chunk is about the subject of the request.",
-                                "FALSE: no chunk is about the subject."),
-            "AUDIT_INPUT_LIMITED": ("TRUE: a fact or context the request needs is absent from all inputs, or the request is too underspecified to answer without assuming.",
-                                    "FALSE: everything the request needs is present. Judge the inputs only, not any answer."),
-            "CHUNKS_CONFLICT": ("TRUE: two chunks state contradictory rules on the same point.", "FALSE: otherwise."),
-            "CHUNKS_WRONG_APPLICABILITY": ("TRUE: the chunks apply to a different region, role, plan or period than the user's, as stated in request or history.",
-                                           "FALSE: they apply, or the user's situation is not stated."),
+            "CHUNKS_ON_TOPIC": (
+                "TRUE: at least one chunk is about the subject of the request.",
+                "FALSE: no chunk is about the subject."),
+            "AUDIT_INPUT_LIMITED": (
+                "TRUE: a fact or specific policy the request needs is absent from all inputs. "
+                "A related but incomplete chunk still counts as LIMITED if the specific rule needed "
+                "is missing (e.g. regional ETR process absent when only global ETR policy is present).",
+                "FALSE: everything the request needs is present. Judge inputs only, not the answer."),
+            "CHUNKS_PARTIAL_COVERAGE": (
+                "TRUE: chunks cover part of a multi-part request but not all parts "
+                "(e.g. covers standard A but not standard B when both were asked about).",
+                "FALSE: chunks cover all parts, or only one thing was asked."),
+            "CHUNKS_CONFLICT": (
+                "TRUE: two chunks state contradictory rules on the same point.",
+                "FALSE: otherwise."),
+            "CHUNKS_WRONG_APPLICABILITY": (
+                "TRUE: chunks apply to a different region, role, plan or period than the user's, "
+                "as stated in the request or history.",
+                "FALSE: they apply, or the user's situation is not stated."),
         },
     },
     "response": {
         "inputs": ["history", "request", "chunks", "response"],
         "flags": {
-            "ANSWER_ADDRESSES_QUESTION": ("TRUE: responds to what was asked (an honest 'not found in policy' counts).",
-                                          "FALSE: answers a different question or ignores the ask."),
-            "ANSWER_HAS_UNSUPPORTED_CLAIM": ("TRUE: states a rule, condition, number or date that is not in the chunks.",
-                                             "FALSE: every factual statement is supported by the chunks."),
-            "ANSWER_CONTRADICTS_CHUNKS": ("TRUE: a statement conflicts with what a chunk says.", "FALSE: no conflict."),
-            "ANSWER_OMITS_CONDITION_OR_EXCEPTION": ("TRUE: a relevant chunk has an 'unless / only if / except' that changes the answer and the response drops it.",
-                                                    "FALSE: the conditions that change the answer are kept."),
-            "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY": ("TRUE: tells the user they do or do not qualify, are approved, or are entitled, as a personal ruling.",
-                                                    "FALSE: only the general rule is stated."),
-            "ANSWERED_WITH_SILENT_ASSUMPTION": ("TRUE: answers as if it knew something the user never said, without stating the assumption.",
-                                                "FALSE: no hidden assumption, or it is stated."),
-            "ACTION_CLAIMED_PERFORMED": ("TRUE: says or implies it did, is doing, or will do something (submitted, cancelled, updated, will follow up).",
-                                         "FALSE: makes no such claim."),
-            "RESPONSE_HAS_GREETING_OR_SMALLTALK": ("TRUE: opens or closes with pleasantries or conversational offers.",
-                                                   "FALSE: only substantive content."),
+            "ANSWER_ADDRESSES_QUESTION": (
+                "TRUE: responds to what was asked. An honest statement that the policy does not "
+                "fully cover the topic, plus whatever partial rule or escalation path is available, "
+                "counts as TRUE. A topic/standard name answered with a description counts as TRUE.",
+                "FALSE: answers a completely different question or ignores the ask entirely."),
+            "ANSWER_ACKNOWLEDGES_LIMITATION": (
+                "TRUE: the response explicitly states that the available sources do not fully cover "
+                "the question AND gives whatever partial rule, fact or escalation path is available.",
+                "FALSE: answers as if information were complete, or refuses without explanation."),
+            "ANSWER_HAS_UNSUPPORTED_CLAIM": (
+                "TRUE: states a rule, condition, number or date that is not in the chunks.",
+                "FALSE: every factual statement is supported by the chunks."),
+            "ANSWER_CONTRADICTS_CHUNKS": (
+                "TRUE: a statement conflicts with what a chunk explicitly says.",
+                "FALSE: no conflict."),
+            "ANSWER_OMITS_CONDITION_OR_EXCEPTION": (
+                "TRUE: a chunk has an 'unless / only if / except' that changes the answer "
+                "and the response drops it.",
+                "FALSE: all conditions that change the answer are kept."),
+            "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY": (
+                "TRUE: tells the user they do or do not qualify, are approved, or are entitled, "
+                "as a personal ruling rather than a general rule.",
+                "FALSE: only the general rule is stated."),
+            "ANSWERED_WITH_SILENT_ASSUMPTION": (
+                "TRUE: answers as if it knew something the user never said, without stating the assumption.",
+                "FALSE: no hidden assumption, or it is stated explicitly."),
+            "ACTION_CLAIMED_PERFORMED": (
+                "TRUE: says or implies it did, is doing, or will do something "
+                "(submitted, cancelled, updated, escalated, will follow up).",
+                "FALSE: makes no such claim."),
+            "ANSWER_COVERS_ALL_PARTS": (
+                "TRUE: all distinct standards, topics or questions in the request are addressed.",
+                "FALSE: one or more named standards or topics in the request are not addressed at all."),
+            "RESPONSE_HAS_GREETING_OR_SMALLTALK": (
+                "TRUE: opens or closes with pleasantries or conversational offers to help further.",
+                "FALSE: only substantive content."),
         },
     },
     "behavior": {
         "inputs": ["history", "request", "response"],
         "flags": {
-            "CLARIFICATION_UNNECESSARY": ("TRUE: asks for something the request or history already provides.",
-                                          "FALSE: the missing information was truly missing."),
-            "CLARIFICATION_VAGUE": ("TRUE: the clarifying question does not say precisely what must be provided.",
-                                    "FALSE: it names exactly what is needed."),
-            "REFUSAL_REASON_INACCURATE": ("TRUE: the stated reason for refusing does not match the real one (e.g. calls an action request 'out of scope').",
-                                          "FALSE: the reason matches, or none is given."),
-            "REFUSAL_LEAKS_SUBSTANCE": ("TRUE: while refusing, it still answers the question or performs the action.",
-                                        "FALSE: it refuses cleanly."),
-            "NEXT_STEP_PROVIDED": ("TRUE: the refusal points the user somewhere (a team, channel, form) or says what to do next.",
-                                   "FALSE: it refuses with no way forward."),
+            "CLARIFICATION_UNNECESSARY": (
+                "TRUE: asks for something the request or history already provides.",
+                "FALSE: the missing information was truly absent."),
+            "CLARIFICATION_VAGUE": (
+                "TRUE: the clarifying question does not say precisely what must be provided.",
+                "FALSE: it names exactly what is needed."),
+            "REFUSAL_REASON_INACCURATE": (
+                "TRUE: the stated reason for refusing does not match the real one "
+                "(e.g. calls an action request 'out of scope').",
+                "FALSE: the reason matches, or none is given."),
+            "REFUSAL_LEAKS_SUBSTANCE": (
+                "TRUE: while refusing, it still answers the question or performs the action.",
+                "FALSE: it refuses cleanly."),
+            "NEXT_STEP_PROVIDED": (
+                "TRUE: the refusal points the user to a team, channel, form, or document repository.",
+                "FALSE: it refuses with no way forward."),
         },
     },
 }
-BEHAVIOR_APPLIES = {"CLARIFICATION_UNNECESSARY": ("clarified",), "CLARIFICATION_VAGUE": ("clarified",),
-                    "REFUSAL_REASON_INACCURATE": REFUSED, "REFUSAL_LEAKS_SUBSTANCE": REFUSED,
-                    "NEXT_STEP_PROVIDED": REFUSED}
-
-TWIN_TASK = ("Two user requests to a company-policy assistant are below. Decide whether they ask for the SAME "
-             "policy information, so that the answer to one would correctly answer the other. Wording changes do not "
-             "matter; a different subject, role, region or condition does. Return JSON only: "
-             '{"evidence": "...", "decision": "TRUE|FALSE|UNKNOWN"}\n')
-
-ROUTE_IN_LOG = False  # set in load()
 
 # COMMAND ----------
+# --------------------------------------------------------------------------
+# DATA LOADING AND HISTORY BUILDING
+# --------------------------------------------------------------------------
+ROUTE_IN_LOG = False
+
+
 def norm(s):
     return " ".join(re.sub(r"[^\w\s?']", " ", str(s).lower()).split())
 
@@ -192,126 +378,252 @@ def b(x):
 def load(path):
     global ROUTE_IN_LOG
     df = pd.read_csv(path)
-    missing = [c for c in ["transaction_id", "conversation_id", "request_created_on", "request", "response",
-                           "document_chunks"] if c not in df.columns]
+    required = ["transaction_id", "conversation_id", "request_created_on",
+                "request", "response", "document_chunks"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"CSV is missing required columns: {missing}")
-    df["request_created_on"] = pd.to_datetime(df["request_created_on"], errors="coerce")
-    if df["request_created_on"].isna().any():
-        bad = df.index[df["request_created_on"].isna()].tolist()[:10]
-        raise ValueError(f"unparseable request_created_on in rows {bad}")
-    df["conversation_id"] = df["conversation_id"].astype(str).where(
-        df["conversation_id"].notna(), "single_" + df.index.astype(str))
+        raise ValueError(f"CSV missing required columns: {missing}")
     if df["transaction_id"].isna().any():
         raise ValueError("transaction_id has empty values")
-    dups = df.loc[df["transaction_id"].duplicated(keep=False), "transaction_id"].unique()[:10].tolist()
+    dups = df.loc[df["transaction_id"].duplicated(keep=False),
+                  "transaction_id"].unique()[:10].tolist()
     if dups:
-        raise ValueError(f"transaction_id must be unique; duplicates include {dups}")
-    df["transaction_id"] = df["transaction_id"].astype(str)
-    df["request"] = df["request"].fillna("").astype(str)
+        raise ValueError(f"transaction_id must be unique; duplicates: {dups}")
+    df["transaction_id"]      = df["transaction_id"].astype(str)
+    df["conversation_id"]     = df["conversation_id"].astype(str)
+    df["request_created_on"]  = pd.to_datetime(
+        df["request_created_on"], errors="coerce")
+    bad = df.index[df["request_created_on"].isna()].tolist()[:10]
+    if bad:
+        raise ValueError(f"unparseable request_created_on in rows {bad}")
+    df["request"]  = df["request"].fillna("").astype(str)
     df["response"] = df["response"].fillna("").astype(str)
-    df["row_id"] = np.arange(len(df))
-    ROUTE_IN_LOG = "route" in df.columns
-    print(f"loaded {len(df)} rows, {df['conversation_id'].nunique()} conversations, route column: {ROUTE_IN_LOG}")
+    df["row_id"]   = np.arange(len(df))
+    ROUTE_IN_LOG   = "route" in df.columns
+    print(f"loaded {len(df)} rows, "
+          f"{df['conversation_id'].nunique()} conversations, "
+          f"route column: {ROUTE_IN_LOG}")
     return df
 
 
+def _parse_chunk_item(item):
+    """Parse one chunk item.
+
+    Each item is a string (or dict) whose lines follow this pattern:
+        **Key:** value        <- tracked field (key extracted from bold label before colon)
+        **Key:** value        <- bold markers stripped; colon is the splitter
+        bare text             <- no colon or no bold label -> goes into misc
+
+    Known keys (case-insensitive, normalised):
+        file_name / file name     -> doc_title
+        document_title / title    -> doc_title  (overrides file_name if present)
+        geography_scope / geo     -> geography
+        any other key: value      -> stored in extras dict
+
+    Everything that cannot be parsed with a colon (plain paragraphs, bold
+    text without a colon, continuation lines) is collected as misc_text
+    and appended to the final chunk text so the judge still sees it.
+    """
+    # accept dict passthrough from old format
+    if isinstance(item, dict):
+        return {
+            "doc_title":  str(item.get("doc_title") or item.get("title")
+                              or item.get("file_name") or "?"),
+            "geography":  str(item.get("geography_scope")
+                              or item.get("geography") or ""),
+            "extras":     {},
+            "misc":       "",
+            "text":       str(item.get("text") or item.get("content") or ""),
+        }
+
+    raw_str   = str(item)
+    lines     = raw_str.splitlines()
+
+    # regex: optional ** on key side, colon separator, value on the right
+    # matches:  **File Name:** foo   |   File Name: foo   |   **Geo:** foo
+    kv_re = re.compile(
+        r"^\s*\*{0,2}([^*:\n]+?)\*{0,2}\s*:\s*(.*)$"
+    )
+
+    fields: dict = {}
+    misc_lines: list = []
+
+    for line in lines:
+        m = kv_re.match(line)
+        if m:
+            key   = re.sub(r"\s+", "_", m.group(1).strip().lower())
+            value = m.group(2).strip()
+            # strip residual bold markers from value
+            value = re.sub(r"\*{1,2}(.*?)\*{1,2}", r"\1", value).strip()
+            fields[key] = value
+        else:
+            clean = re.sub(r"\*{1,2}(.*?)\*{1,2}", r"\1", line).strip()
+            if clean:
+                misc_lines.append(clean)
+
+    # canonical field mapping
+    def pick(*keys):
+        for k in keys:
+            if fields.get(k):
+                return fields.pop(k)
+        return ""
+
+    doc_title  = pick("document_title", "title", "file_name", "file name",
+                       "document_name")
+    geography  = pick("geography_scope", "geography_scope_", "geography",
+                      "geo_scope", "geo")
+    # everything else that had a colon goes to extras
+    extras     = {k: v for k, v in fields.items() if v}
+    misc_text  = " | ".join(misc_lines)
+
+    # build the text the judge reads: structured fields first, then misc
+    text_parts = []
+    if doc_title:
+        text_parts.append(f"Document: {doc_title}")
+    if geography:
+        text_parts.append(f"Geography: {geography}")
+    for k, v in extras.items():
+        text_parts.append(f"{k.replace('_', ' ').title()}: {v}")
+    if misc_text:
+        text_parts.append(misc_text)
+
+    return {
+        "doc_title": doc_title or "?",
+        "geography": geography,
+        "extras":    extras,
+        "misc":      misc_text,
+        "text":      "\n".join(text_parts),
+    }
+
+
 def parse_chunks(raw):
-    """Accepts a JSON list of dicts/strings, a single JSON dict, or plain text."""
+    """Parse document_chunks column.
+
+    raw is expected to be a JSON list of items, where each item is either:
+      - a string with **Key:** Value lines  (new format)
+      - a dict                              (legacy format)
+      - anything else -> treated as plain text
+
+    Returns a list of dicts with keys: text, doc_title, geography, extras, misc.
+    """
     if pd.isna(raw) or str(raw).strip() in ("", "[]", "null", "None"):
         return []
+
+    # try JSON parse first
     try:
         obj = json.loads(raw)
     except (TypeError, ValueError):
-        return [{"text": str(raw), "doc_title": "?"}]
-    if isinstance(obj, dict):
-        obj = [obj]
+        # not JSON: treat the whole value as one plain-text chunk
+        return [_parse_chunk_item(str(raw))]
+
+    # normalise to list
     if not isinstance(obj, list):
-        return [{"text": str(obj), "doc_title": "?"}]
-    out = []
-    for c in obj:
-        if isinstance(c, dict):
-            out.append({"text": str(c.get("text") or c.get("content") or ""),
-                        "doc_title": str(c.get("doc_title") or c.get("title") or c.get("source") or "?")})
-        else:
-            out.append({"text": str(c), "doc_title": "?"})
-    return out
+        obj = [obj]
+
+    return [_parse_chunk_item(item) for item in obj]
 
 
 def build_history(df):
-    """Prior turns only: same conversation_id, request_created_on strictly earlier than this row."""
     hist = {}
-    ordered = df.sort_values(["conversation_id", "request_created_on", "row_id"])
+    ordered = df.sort_values(
+        ["conversation_id", "request_created_on", "row_id"])
     for _, g in ordered.groupby("conversation_id", sort=False):
         recs = g.to_dict("records")
         for r in recs:
-            prior = [p for p in recs if p["request_created_on"] < r["request_created_on"]][-MAX_HISTORY_TURNS:]
-            hist[r["row_id"]] = [m for p in prior for m in (
-                {"role": "user", "content": p["request"]},
-                {"role": "assistant", "content": p["response"]})]
+            prior = [p for p in recs
+                     if p["request_created_on"] < r["request_created_on"]]
+            prior = prior[-MAX_HISTORY_TURNS:]
+            hist[r["row_id"]] = [
+                m for p in prior for m in (
+                    {"role": "user",      "content": p["request"]},
+                    {"role": "assistant", "content": p["response"]},
+                )
+            ]
     return hist
 
 
-def detect_static(df):
-    counts = df["response"].map(norm).value_counts()
-    templates = set(counts[counts >= STATIC_MIN_REPEAT].index) - {""}
-    print(f"{len(templates)} static templates cover {int(df['response'].map(norm).isin(templates).sum())} rows")
-    return templates
+def tag_static(df):
+    """Return set of row_ids that match a declared static template."""
+    static_ids = set()
+    norm_map   = {norm(k): v for k, v in STATIC_TEMPLATES.items()}
+    for r in df.to_dict("records"):
+        key = norm(r["response"])
+        if key in norm_map:
+            static_ids.add(r["row_id"])
+    print(f"{len(static_ids)} rows match a declared static template "
+          f"({len(STATIC_TEMPLATES)} templates declared)")
+    return static_ids, norm_map
 
 
 # COMMAND ----------
+# --------------------------------------------------------------------------
+# PROMPT RENDERING
+# --------------------------------------------------------------------------
 def render(name, c):
     if name == "corpus":
-        return "## POLICY CORPUS INDEX\n" + ("\n".join(f"- {x}" for x in CORPUS_INDEX) or "(not provided)")
+        return "## POLICY CORPUS INDEX\n" + (
+            "\n".join(f"- {x}" for x in CORPUS_INDEX) or "(not provided)")
     if name == "history":
         return "## CONVERSATION HISTORY (earlier turns only)\n" + (
-            "\n".join(f"{m['role']}: {m['content']}" for m in c["history"]) or "(none)")
+            "\n".join(f"{m['role']}: {m['content']}"
+                      for m in c["history"]) or "(none)")
     if name == "request":
         return f"## CURRENT USER REQUEST\n{c['request']}"
     if name == "chunks":
         budget, parts = MAX_TOTAL_CHUNK_CHARS, []
         for i, x in enumerate(c["chunks"]):
             if budget <= 0:
-                parts.append(f"[{len(c['chunks']) - i} further chunk(s) omitted: total budget exhausted. "
-                             f"Judge AUDIT_INPUT_LIMITED conservatively.]")
+                remaining = len(c["chunks"]) - i
+                parts.append(
+                    f"[{remaining} further chunk(s) omitted: total budget "
+                    f"exhausted. Judge AUDIT_INPUT_LIMITED conservatively.]")
                 break
-            text = x["text"][:budget]        # never take more than what remains
+            text = x["text"][:budget]
             parts.append(f"[chunk {i + 1} | {x['doc_title']}]\n{text}")
-            budget -= len(text)              # deduct what was actually taken
-        return "## RETRIEVED CHUNKS\n" + ("\n\n".join(parts) or "(none retrieved)")
+            budget -= len(text)
+        return "## RETRIEVED CHUNKS\n" + (
+            "\n\n".join(parts) or "(none retrieved)")
     if name == "response":
         return f"## ASSISTANT RESPONSE\n{c['response']}"
     raise KeyError(name)
 
 
 def build_prompt(name, c):
-    spec = CALLS[name]
-    defs = "\n".join(f"- {k}\n    {t}\n    {f}" for k, (t, f) in spec["flags"].items())
+    spec  = CALLS[name]
+    defs  = "\n".join(
+        f"- {k}\n    {t}\n    {f}"
+        for k, (t, f) in spec["flags"].items())
     extra = ""
     if spec.get("scope"):
         extra += SCOPE_TEXT
     if spec.get("examples"):
-        extra += "\n\nBOUNDARY EXAMPLES:\n" + "\n".join(f"- {e}" for e in spec["examples"])
+        extra += "\n\nBOUNDARY EXAMPLES:\n" + "\n".join(
+            f"- {e}" for e in spec["examples"])
     if name == "response" and not ROUTE_IN_LOG:
         extra += ROUTE_TEXT
     sections = "\n\n".join(render(s, c) for s in spec["inputs"])
-    return f"{PREAMBLE}\n\nFLAGS:\n{defs}{extra}\n\n{sections}\n\nReturn the JSON now."
+    return (f"{PREAMBLE}\n\nFLAGS:\n{defs}{extra}"
+            f"\n\n{sections}\n\nReturn the JSON now.")
 
 
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# LLM CALL
+# --------------------------------------------------------------------------
 def ask(prompt, call_name="response"):
-    """One LLM call returning parsed JSON. One retry on a malformed reply, then raises.
-    Passes max_tokens at invoke time when the constructor does not accept it."""
     tokens = MAX_TOKENS.get(call_name, 1000)
-    last = None
+    last   = None
     for attempt in range(2):
         try:
-            if _llm_max_tokens_in_constructor:
+            if _max_tokens_in_constructor:
                 text = str(llm.invoke(prompt).content)
             else:
                 text = str(llm.invoke(prompt, max_tokens=tokens).content)
             match = re.search(r"\{.*\}", text, re.S)
             if not match:
-                raise ValueError(f"no JSON object in reply (attempt {attempt + 1}); raw: {text[:200]!r}")
+                raise ValueError(
+                    f"no JSON in reply (attempt {attempt + 1}); "
+                    f"raw: {text[:300]!r}")
             return json.loads(match.group(0))
         except Exception as e:
             last = e
@@ -319,7 +631,6 @@ def ask(prompt, call_name="response"):
 
 
 def run_call(name, c, errors):
-    """Returns {flag: (decision, evidence)}. Bad or missing decisions become UNKNOWN and are recorded."""
     spec = CALLS[name]
     keys = list(spec["flags"])
     if spec.get("scope"):
@@ -334,13 +645,13 @@ def run_call(name, c, errors):
     out = {}
     for k in keys:
         item = data.get(k) if isinstance(data.get(k), dict) else {}
-        d = str(item.get("decision", "")).strip()
+        d    = str(item.get("decision", "")).strip()
         if k == "SCOPE_CATEGORY":
             d, ok = d.lower(), d.lower() in SCOPE
         elif k == "ROUTE_OBSERVED":
             d, ok = d.lower(), d.lower() in ROUTES
         else:
-            d = d.upper()
+            d  = d.upper()
             ok = d in VALID
         if not ok:
             errors.append(f"{name}.{k}: bad decision '{d}'")
@@ -352,169 +663,219 @@ def run_call(name, c, errors):
 def put(flags, ev, res):
     for k, (d, e) in res.items():
         flags[k] = d
-        ev[k] = e
+        ev[k]    = e
 
 
 def ctx_of(row, hist):
-    return {"history": hist[row["row_id"]], "request": row["request"], "response": row["response"],
-            "chunks": parse_chunks(row["document_chunks"])}
-
-
-def code_flags(row, c):
-    resp = row["response"]
     return {
-        "AUDIT_TRACE_INCOMPLETE": b(not row["request"] or not resp),
-        "RETRIEVAL_RETURNED_CHUNKS": b(bool(c["chunks"])),
-        "RESPONSE_EXCESSIVE_LENGTH": b(len(resp) > MAX_RESPONSE_CHARS),
-        "RESPONSE_EXPOSES_PII": b(bool(PII.search(resp))),
-        "MATERIAL_TOOL_CALL_MADE": NA,            # no tool-call log in the CSV
-        "CORPUS_HAS_ANSWER": UNKNOWN,             # set only when a confirmed answered twin exists
-        "ANSWERED_ELSEWHERE": NA,
+        "history":  hist[row["row_id"]],
+        "request":  row["request"],
+        "response": row["response"],
+        "chunks":   parse_chunks(row["document_chunks"]),
     }
 
 
 # COMMAND ----------
+# --------------------------------------------------------------------------
+# CODE FLAGS (no LLM)
+# --------------------------------------------------------------------------
+def code_flags(row, c):
+    resp = row["response"]
+    return {
+        "AUDIT_TRACE_INCOMPLETE":    b(not row["request"] or not resp),
+        "RETRIEVAL_RETURNED_CHUNKS": b(bool(c["chunks"])),
+        "RESPONSE_EXCESSIVE_LENGTH": b(len(resp) > 1200),
+        "RESPONSE_EXPOSES_PII":      b(bool(PII.search(resp))),
+        "MATERIAL_TOOL_CALL_MADE":   NA,      # no tool-call log in CSV
+        "CORPUS_HAS_ANSWER":         UNKNOWN, # set only via confirmed twin
+        "ANSWERED_ELSEWHERE":        NA,
+    }
+
+
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# PHASE A: request analysis (never sees the response)
+# --------------------------------------------------------------------------
 def phase_a(row, hist):
-    """Per row: code flags + request-analysis call. The judge never sees the response here."""
-    c = ctx_of(row, hist)
-    st = {"row": row, "ctx": c, "flags": code_flags(row, c), "ev": {}, "errors": []}
+    c  = ctx_of(row, hist)
+    st = {
+        "row": row, "ctx": c,
+        "flags": code_flags(row, c),
+        "ev": {}, "errors": [],
+        "static": False, "twin": None,
+    }
     put(st["flags"], st["ev"], run_call("request", c, st["errors"]))
     st["cat"] = st["flags"].get("SCOPE_CATEGORY", UNKNOWN)
-    st["static"] = False
     return st
 
 
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# PHASE B: static tagging + answered-elsewhere twin matching
+# --------------------------------------------------------------------------
 def confirm_twin(a, b_):
+    twin_prompt = (
+        "Two user requests to a company-policy assistant are below. "
+        "Decide whether they ask for the SAME policy information so that "
+        "the answer to one would correctly answer the other. Wording changes "
+        "do not matter; a different subject, role, region or condition does.\n"
+        "Return JSON only: "
+        '{"evidence": "...", "decision": "TRUE|FALSE|UNKNOWN"}\n\n'
+        f"REQUEST A: {a['row']['request']}\n"
+        f"REQUEST B: {b_['row']['request']}")
     try:
-        d = ask(TWIN_TASK + f"REQUEST A: {a['row']['request']}\nREQUEST B: {b_['row']['request']}")
+        d = ask(twin_prompt, call_name="twin")
         return str(d.get("decision", "")).upper() == TRUE
-    except Exception:
+    except Exception as e:
+        a["errors"].append(f"twin_confirm: {e}")
         return None
 
 
-def phase_b(states, templates):
-    """Static templates: next-step judged once per template. Blocked requests: look for answered twins."""
-    cache = {}
+def phase_b(states, static_ids, norm_map):
+    # tag static rows
     for st in states:
-        key = norm(st["row"]["response"])
-        st["static"] = key in templates
-        if not st["static"]:
-            continue
-        if key not in cache:
-            errs = []
-            cache[key] = run_call("behavior", st["ctx"], errs)["NEXT_STEP_PROVIDED"]
-            st["errors"] += errs
-        st["next_step"] = cache[key]          # (decision, evidence)
+        st["static"] = st["row"]["row_id"] in static_ids
+        if st["static"]:
+            key = norm(st["row"]["response"])
+            tpl = norm_map.get(key, {})
+            # next_step always FALSE for dead-end templates
+            st["flags"]["NEXT_STEP_PROVIDED"] = FALSE
+            st["ev"]["NEXT_STEP_PROVIDED"]    = (
+                f"static template ({tpl.get('type','?')}): declared dead end")
 
-    blocked = [s for s in states if s["static"] and not s["ctx"]["history"] and s["cat"] in INSCOPE]
-    pool = [s for s in states if not s["static"] and not s["ctx"]["history"] and s["cat"] in INSCOPE
-            and s["ctx"]["chunks"] and s["row"]["response"]]
+    # twin matching for blocked standalone in-scope rows
+    blocked = [s for s in states
+               if s["static"]
+               and not s["ctx"]["history"]
+               and s["cat"] in INSCOPE]
+    pool = [s for s in states
+            if not s["static"]
+            and not s["ctx"]["history"]
+            and s["cat"] in INSCOPE
+            and s["ctx"]["chunks"]
+            and s["row"]["response"]]
     if not blocked or not pool:
         print("no blocked/answered pairs to match")
         return
+
+    all_texts = ([norm(s["row"]["request"]) for s in blocked]
+                 + [norm(s["row"]["request"]) for s in pool])
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5))
-    vec.fit([norm(s["row"]["request"]) for s in blocked + pool])
-    sim = (vec.transform([norm(s["row"]["request"]) for s in blocked])
-           @ vec.transform([norm(s["row"]["request"]) for s in pool]).T).toarray()
-    confirmed, cache_pairs, n = 0, {}, 0
+    E   = vec.fit_transform(all_texts).toarray()
+    eb, ea = E[:len(blocked)], E[len(blocked):]
+    norms_b = np.linalg.norm(eb, axis=1, keepdims=True).clip(min=1e-9)
+    norms_a = np.linalg.norm(ea, axis=1, keepdims=True).clip(min=1e-9)
+    sim = (eb / norms_b) @ (ea / norms_a).T
+
+    confirmed, cache = 0, {}
     for i, s in enumerate(blocked):
-        j = int(sim[i].argmax())
-        if sim[i, j] < TWIN_SIM_THRESHOLD:
+        j  = int(sim[i].argmax())
+        sc = float(sim[i, j])
+        if sc < TWIN_SIM_THRESHOLD:
             continue
         key = (norm(s["row"]["request"]), j)
-        if key not in cache_pairs:
-            cache_pairs[key] = confirm_twin(s, pool[j])
-        n += 1
-        if cache_pairs[key]:
-            s["twin"], s["twin_score"] = pool[j], float(sim[i, j])
+        if key not in cache:
+            cache[key] = confirm_twin(s, pool[j])
+        if cache[key]:
+            s["twin"]       = pool[j]
+            s["twin_score"] = sc
+            s["flags"]["ANSWERED_ELSEWHERE"] = TRUE
+            s["flags"]["CORPUS_HAS_ANSWER"]  = TRUE
+            s["ev"]["ANSWERED_ELSEWHERE"] = (
+                f"twin transaction {pool[j]['row']['transaction_id']} "
+                f"(sim {sc:.2f}): {pool[j]['row']['request'][:200]}")
             confirmed += 1
-    print(f"{len(blocked)} blocked standalone requests, {n} had a candidate twin, {confirmed} confirmed")
+    print(f"{len(blocked)} blocked standalone requests, "
+          f"{confirmed} confirmed answered twins")
 
 
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# PHASE C: evidence, response, behavior calls + route resolution
+# --------------------------------------------------------------------------
 def phase_c(st):
-    """Per row: evidence call, response call (or template), behavior call where applicable, then routing."""
-    row, c, f, ev, errs = st["row"], st["ctx"], st["flags"], st["ev"], st["errors"]
+    row, c, f, ev, errs = (
+        st["row"], st["ctx"], st["flags"], st["ev"], st["errors"])
 
-    if c["chunks"]:
+    # evidence call (skip for static rows with no chunks)
+    if c["chunks"] and not st["static"]:
         put(f, ev, run_call("evidence", c, errs))
     else:
         for k in CALLS["evidence"]["flags"]:
             f[k] = NA
 
+    # response call
     if st["static"]:
+        # static rows: no response quality to judge
         for k in CALLS["response"]["flags"]:
             f[k] = NA
-        if ROUTE_IN_LOG:
-            route = str(row.get("route", "")).strip().lower()
-        else:
-            route = "refused_action" if st["cat"] == "action_request" else "refused_scope"
-        f["NEXT_STEP_PROVIDED"], ev["NEXT_STEP_PROVIDED"] = st["next_step"]   # judged once per template
+        route = (str(row.get("route", "")).strip().lower()
+                 if ROUTE_IN_LOG
+                 else ("refused_action"
+                       if norm_map_lookup(row["response"]) == "action_refusal"
+                       else "refused_scope"))
     else:
         put(f, ev, run_call("response", c, errs))
         observed = f.pop("ROUTE_OBSERVED", UNKNOWN)
-        route = str(row.get("route", "")).strip().lower() if ROUTE_IN_LOG else observed
+        route    = (str(row.get("route", "")).strip().lower()
+                    if ROUTE_IN_LOG else observed)
         if route not in ROUTES:
             route = UNKNOWN
 
-    if "twin" in st:
-        f["ANSWERED_ELSEWHERE"] = TRUE
-        f["CORPUS_HAS_ANSWER"] = TRUE
-        ev["ANSWERED_ELSEWHERE"] = (f"twin transaction {st['twin']['row']['transaction_id']} "
-                                    f"(sim {st['twin_score']:.2f}): {st['twin']['row']['request'][:200]}")
-    elif st["static"]:
-        f["ANSWERED_ELSEWHERE"] = UNKNOWN
-
-    # behavior call only when the agent clarified or refused a non-template response
+    # behavior call: only for non-static clarifications and refusals
     if not st["static"] and route in ("clarified",) + REFUSED:
         put(f, ev, run_call("behavior", c, errs))
 
-    # route-based applicability: flags that do not fit the route become NOT_APPLICABLE
+    # route-based applicability
     for k in ANSWER_ONLY:
         if route != "answered":
             f[k] = NA
     for k, routes in BEHAVIOR_APPLIES.items():
         if k == "NEXT_STEP_PROVIDED":
-            if route not in REFUSED:
+            if not st["static"] and route not in REFUSED:
                 f[k] = NA
         elif st["static"] or route not in routes:
             f[k] = NA
+
+    # numbers in response not in chunks
     if route == "answered" and c["chunks"]:
-        nums = set(re.findall(r"\d+(?:[.,]\d+)?", row["response"]))
-        cn = set(re.findall(r"\d+(?:[.,]\d+)?", " ".join(x["text"] for x in c["chunks"])))
-        f["ANSWER_NUMBERS_UNSUPPORTED"] = b(bool(nums - cn))
+        nums   = set(re.findall(r"\d+(?:[.,]\d+)?", row["response"]))
+        c_nums = set(re.findall(
+            r"\d+(?:[.,]\d+)?",
+            " ".join(x["text"] for x in c["chunks"])))
+        f["ANSWER_NUMBERS_UNSUPPORTED"] = b(bool(nums - c_nums))
     elif route == "answered":
         f["ANSWER_NUMBERS_UNSUPPORTED"] = UNKNOWN
+    else:
+        f["ANSWER_NUMBERS_UNSUPPORTED"] = NA
+
     for r_ in ROUTES:
         f[f"ROUTE_{r_.upper()}"] = b(route == r_)
     st["route"] = route
     return st
 
 
+def norm_map_lookup(response_text):
+    """Return template type for a static response, or None."""
+    nm = {norm(k): v for k, v in STATIC_TEMPLATES.items()}
+    return nm.get(norm(response_text), {}).get("type")
+
+
 # COMMAND ----------
-CAUSE_OWNER = {
-    "intent_misread_action_detector": "intent detection", "intent_misread": "intent detection / prompt",
-    "ambiguity_missed": "prompt / routing", "context_continuity_failure": "conversation memory",
-    "retrieval_coverage_gap": "corpus owners", "retrieval_precision_miss": "retriever / ranking",
-    "retrieval_applicability_miss": "retriever / metadata", "retrieval_conflict": "corpus owners",
-    "guardrail_blocked_answerable_question": "guardrail / scope definition",
-    "refused_question_answerable_generally": "guardrail / prompt",
-    "scope_definition_too_narrow": "guardrail / scope definition",
-    "no_next_step_in_template": "static response design", "prompt_or_routing": "prompt / routing",
-    "generation_or_communication": "response prompt", "undetermined": "manual review",
-}
-THEME_PRIORITY = ["excessive_guardrail", "context_continuity_failure", "unnecessary_clarification",
-                  "ambiguous_user_context", "intent_misinterpretation", "incomplete_next_step_guidance",
-                  "communication_quality"]
-
-
+# --------------------------------------------------------------------------
+# DERIVED FLAGS, THEMES, ROOT CAUSE, GAP TYPE
+# --------------------------------------------------------------------------
 def derive(route, f):
-    d = {}
+    d   = {}
     cat = f.get("SCOPE_CATEGORY", UNKNOWN)
-    known = cat != UNKNOWN
-    d["REQUEST_IN_POLICY_SCOPE"] = b(cat in INSCOPE) if known else UNKNOWN
-    d["REQUEST_IS_ACTION_REQUEST"] = b(cat == "action_request") if known else UNKNOWN
-    d["REQUEST_IS_GREETING_OR_SMALLTALK"] = b(cat == "chitchat") if known else UNKNOWN
     amb = f.get("REQUEST_IS_AMBIGUOUS", UNKNOWN)
+    known = cat != UNKNOWN
+
+    d["REQUEST_IN_POLICY_SCOPE"]       = b(cat in INSCOPE) if known else UNKNOWN
+    d["REQUEST_IS_ACTION_REQUEST"]     = b(cat == "action_request") if known else UNKNOWN
+    d["REQUEST_IS_GREETING_OR_SMALLTALK"] = b(cat == "chitchat") if known else UNKNOWN
+
+    # expected route
     if not known:
         expected = UNKNOWN
     elif cat == "action_request":
@@ -528,141 +889,394 @@ def derive(route, f):
     else:
         expected = "answered"
     d["EXPECTED_ROUTE"] = expected
+
     unk = expected == UNKNOWN
     for r_ in ROUTES:
-        d[f"SHOULD_HAVE_{r_.upper()}"] = UNKNOWN if unk else b(expected == r_)
+        d[f"SHOULD_HAVE_{r_.upper()}"] = (
+            UNKNOWN if unk else b(expected == r_))
     d["ROUTE_MISMATCH"] = UNKNOWN if unk else b(expected != route)
-    d["GUARDRAIL_FALSE_BLOCK"] = UNKNOWN if unk else b(route == "refused_scope" and expected in ("answered", "clarified"))
-    d["ACTION_GUARDRAIL_FALSE_BLOCK"] = UNKNOWN if not known else b(route == "refused_action" and cat in INSCOPE)
-    d["GUARDRAIL_FALSE_PASS"] = UNKNOWN if unk else b(expected in REFUSED and route not in REFUSED)
+
+    # guardrail flags
+    d["GUARDRAIL_FALSE_BLOCK"] = (
+        UNKNOWN if unk
+        else b(route == "refused_scope"
+               and expected in ("answered", "clarified")))
+
+    # action guardrail fires when refused_action but request was actually
+    # in scope and procedural (asking about process, not to perform it)
+    d["ACTION_GUARDRAIL_FALSE_BLOCK"] = (
+        UNKNOWN if not known
+        else b(route == "refused_action"
+               and cat in INSCOPE
+               and f.get("REQUEST_IS_PROCEDURAL") == TRUE))
+
+    d["GUARDRAIL_FALSE_PASS"] = (
+        UNKNOWN if unk
+        else b(expected in REFUSED and route not in REFUSED))
     return d
 
 
 def themes_for(route, f):
     th = []
-    if TRUE in (f.get("GUARDRAIL_FALSE_BLOCK"), f.get("ACTION_GUARDRAIL_FALSE_BLOCK")):
+
+    # Excessive guardrail
+    if TRUE in (f.get("GUARDRAIL_FALSE_BLOCK"),
+                f.get("ACTION_GUARDRAIL_FALSE_BLOCK")):
         th.append("excessive_guardrail")
-    if route == "clarified" and f.get("HISTORY_HAS_NEEDED_INFO") == TRUE:
+
+    # Context continuity failure: only when history actually had the needed info
+    if (route == "clarified"
+            and f.get("HISTORY_HAS_NEEDED_INFO") == TRUE):
         th.append("context_continuity_failure")
-    if route == "clarified" and f.get("EXPECTED_ROUTE") == "answered":
+
+    # Unnecessary clarification (not driven by history gap)
+    if (route == "clarified"
+            and f.get("EXPECTED_ROUTE") == "answered"
+            and f.get("HISTORY_HAS_NEEDED_INFO") != TRUE):
         th.append("unnecessary_clarification")
-    if f.get("REQUEST_IS_AMBIGUOUS") == TRUE and (route == "answered" or f.get("CLARIFICATION_VAGUE") == TRUE):
+
+    # Ambiguous user context: only when agent answered despite ambiguity
+    # OR when it asked a vague clarification. NOT when it correctly clarified.
+    # NOT when the agent acknowledged a limitation (that is a corpus gap, not ambiguity).
+    if (f.get("REQUEST_IS_AMBIGUOUS") == TRUE
+            and f.get("ANSWER_ACKNOWLEDGES_LIMITATION") != TRUE
+            and (route == "answered"
+                 or f.get("CLARIFICATION_VAGUE") == TRUE)):
         th.append("ambiguous_user_context")
-    if route == "answered" and f.get("ANSWER_ADDRESSES_QUESTION") == FALSE:
+
+    # Ambiguous action-or-question: when both ambiguity and action false-block
+    # fire, treat as ambiguity, not excessive guardrail (agent was right to be cautious)
+    if ("excessive_guardrail" in th
+            and f.get("REQUEST_IS_AMBIGUOUS") == TRUE
+            and f.get("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE):
+        th.remove("excessive_guardrail")
+        if "ambiguous_user_context" not in th:
+            th.append("ambiguous_user_context")
+
+    # Intent misinterpretation: answered but addressed the wrong question
+    if (route == "answered"
+            and f.get("ANSWER_ADDRESSES_QUESTION") == FALSE):
         th.append("intent_misinterpretation")
-    if route in REFUSED and f.get("NEXT_STEP_PROVIDED") == FALSE:
+
+    # Partial answer: answered but only covered part of a multi-part request
+    # OR corpus had partial coverage
+    if (route == "answered"
+            and (f.get("ANSWER_COVERS_ALL_PARTS") == FALSE
+                 or f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE)
+            and f.get("ANSWER_ADDRESSES_QUESTION") != FALSE):
+        th.append("partial_answer")
+
+    # Incomplete next step guidance
+    if (route in REFUSED
+            and f.get("NEXT_STEP_PROVIDED") == FALSE):
         th.append("incomplete_next_step_guidance")
+
+    # Document location: add incomplete_next_step as secondary
+    # even when guardrail fired (Wolfsberg-type case)
+    if (f.get("REQUEST_IS_DOCUMENT_LOCATION") == TRUE
+            and route in REFUSED
+            and "incomplete_next_step_guidance" not in th):
+        th.append("incomplete_next_step_guidance")
+
+    # Communication quality
     if any(f.get(x) == TRUE for x in LOW_PRIORITY):
         th.append("communication_quality")
+
     return [x for x in THEME_PRIORITY if x in th]
 
 
+def gap_type_for(route, f):
+    """Classify why the response was limited or refused."""
+    in_scope   = f.get("REQUEST_IN_POLICY_SCOPE") == TRUE
+    limited    = f.get("AUDIT_INPUT_LIMITED") == TRUE
+    ack        = f.get("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE
+    has_answer = f.get("CORPUS_HAS_ANSWER")
+
+    if in_scope and limited and ack:
+        # agent handled it correctly; root cause is corpus
+        return "corpus_gap_acknowledged"
+    if in_scope and limited and not ack and route == "answered":
+        return "corpus_gap_mishandled"
+    if in_scope and route in REFUSED and f.get("GUARDRAIL_FALSE_BLOCK") == TRUE:
+        return "excessive_guardrail_scope"
+    if in_scope and route in REFUSED and f.get("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE:
+        return "excessive_guardrail_action"
+    if not in_scope and route in REFUSED:
+        return "out_of_scope"
+    if f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE:
+        return "corpus_partial"
+    return None
+
+
 def root_cause_for(route, f, themes):
-    """Earliest failing stage wins: request understanding -> context -> retrieval -> decision -> generation."""
+    """Earliest failing stage wins."""
     if not themes:
         return None
     cat = f.get("SCOPE_CATEGORY")
-    if f.get("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE and f.get("REQUEST_IS_PROCEDURAL") == TRUE:
-        return {"stage": "request_understanding", "cause": "intent_misread_action_detector"}
+
+    # 1. request understanding
+    if (f.get("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE
+            and f.get("REQUEST_IS_PROCEDURAL") == TRUE
+            and f.get("REQUEST_IS_AMBIGUOUS") != TRUE):
+        return {"stage": "request_understanding",
+                "cause": "intent_misread_action_detector"}
     if "intent_misinterpretation" in themes:
         return {"stage": "request_understanding", "cause": "intent_misread"}
     if "ambiguous_user_context" in themes:
         return {"stage": "request_understanding", "cause": "ambiguity_missed"}
-    if f.get("HISTORY_HAS_NEEDED_INFO") == TRUE and route in ("clarified", "refused_scope"):
+
+    # 2. context use
+    if (f.get("HISTORY_HAS_NEEDED_INFO") == TRUE
+            and route in ("clarified",) + REFUSED):
         return {"stage": "context_use", "cause": "context_continuity_failure"}
-    if f.get("RETRIEVAL_RETURNED_CHUNKS") == TRUE and (
-            f.get("AUDIT_INPUT_LIMITED") == TRUE or f.get("CHUNKS_ON_TOPIC") == FALSE):
+
+    # 3. retrieval (applicability first, then coverage)
+    retrieval_bad = (
+        f.get("RETRIEVAL_RETURNED_CHUNKS") == TRUE
+        and (f.get("AUDIT_INPUT_LIMITED") == TRUE
+             or f.get("CHUNKS_ON_TOPIC") == FALSE
+             or f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE))
+    if retrieval_bad:
         if f.get("CHUNKS_WRONG_APPLICABILITY") == TRUE:
-            return {"stage": "retrieval", "cause": "retrieval_applicability_miss"}
+            return {"stage": "retrieval",
+                    "cause": "retrieval_applicability_miss"}
         if f.get("CHUNKS_CONFLICT") == TRUE:
             return {"stage": "retrieval", "cause": "retrieval_conflict"}
+        if f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE:
+            return {"stage": "retrieval",
+                    "cause": "retrieval_partial_coverage"}
         if f.get("CORPUS_HAS_ANSWER") == TRUE:
             return {"stage": "retrieval", "cause": "retrieval_precision_miss"}
         if f.get("CORPUS_HAS_ANSWER") == FALSE:
             return {"stage": "retrieval", "cause": "retrieval_coverage_gap"}
         return {"stage": "retrieval", "cause": "undetermined"}
-    if "excessive_guardrail" in themes or "unnecessary_clarification" in themes:
+
+    # corpus gap acknowledged correctly: not a failure, but record it
+    if (f.get("AUDIT_INPUT_LIMITED") == TRUE
+            and f.get("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE):
+        return {"stage": "retrieval",
+                "cause": "acknowledged_limitation_correctly"}
+
+    # 4. decision
+    if ("excessive_guardrail" in themes
+            or "unnecessary_clarification" in themes):
         if f.get("CORPUS_HAS_ANSWER") == TRUE:
-            return {"stage": "decision", "cause": "guardrail_blocked_answerable_question"}
+            return {"stage": "decision",
+                    "cause": "guardrail_blocked_answerable"}
+        if f.get("REQUEST_IS_DOCUMENT_LOCATION") == TRUE:
+            return {"stage": "decision",
+                    "cause": "guardrail_refused_policy_question"}
         if cat == "adjacent":
-            return {"stage": "decision", "cause": "scope_definition_too_narrow"}
+            return {"stage": "decision",
+                    "cause": "scope_definition_too_narrow"}
         if cat == "in_scope_user_specific":
-            return {"stage": "decision", "cause": "refused_question_answerable_generally"}
-        return {"stage": "decision", "cause": "prompt_or_routing"}   # residual: nothing upstream failed
+            return {"stage": "decision",
+                    "cause": "refused_answerable_generally"}
+        return {"stage": "decision", "cause": "prompt_or_routing"}
+
     if "incomplete_next_step_guidance" in themes:
         return {"stage": "decision", "cause": "no_next_step_in_template"}
+
+    if "partial_answer" in themes:
+        return {"stage": "retrieval", "cause": "retrieval_partial_coverage"}
+
+    # 5. generation / communication
+    if themes == ["communication_quality"]:
+        return {"stage": "generation",
+                "cause": "generation_or_communication"}
+
     return {"stage": "generation", "cause": "generation_or_communication"}
 
 
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# VALIDATOR
+# --------------------------------------------------------------------------
 def validate(f):
     issues = []
-    if f.get("RETRIEVAL_RETURNED_CHUNKS") == FALSE and f.get("CHUNKS_ON_TOPIC") == TRUE:
-        issues.append("CHUNKS_ON_TOPIC=TRUE but no chunks were returned")
-    if f.get("MATERIAL_TOOL_CALL_MADE") == TRUE and f.get("ACTION_CLAIMED_PERFORMED") == FALSE:
-        issues.append("state-changing tool called but response claims no action")
+    if (f.get("RETRIEVAL_RETURNED_CHUNKS") == FALSE
+            and f.get("CHUNKS_ON_TOPIC") == TRUE):
+        issues.append("CHUNKS_ON_TOPIC=TRUE but no chunks returned")
+    if (f.get("RETRIEVAL_RETURNED_CHUNKS") == TRUE
+            and f.get("AUDIT_INPUT_LIMITED") == FALSE
+            and f.get("CHUNKS_ON_TOPIC") == FALSE
+            and f.get("REQUEST_IN_POLICY_SCOPE") == TRUE
+            and f.get("REQUEST_NEEDS_USER_SPECIFIC_DATA") == FALSE):
+        issues.append(
+            "in-scope request, chunks off-topic, yet inputs judged sufficient")
     return issues
 
 
-def verdict(f, issues, errors):
-    reasons = [x for x in CRITICAL if f.get(x) == TRUE]
-    reasons += [x for x in ROUTE_ERRORS if f.get(x) == TRUE]
-    reasons += [x for x in QUALITY if f.get(x) == TRUE]
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# VERDICT (tiered)
+# --------------------------------------------------------------------------
+def verdict(f, issues, errors, themes):
+    # suppress quality flags when agent correctly acknowledged limitation
+    ack_suppressed = set()
+    if (f.get("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE
+            and f.get("AUDIT_INPUT_LIMITED") == TRUE):
+        ack_suppressed = {"ANSWER_HAS_UNSUPPORTED_CLAIM",
+                          "ANSWER_OMITS_CONDITION_OR_EXCEPTION"}
+
+    critical = [x for x in CRITICAL if f.get(x) == TRUE]
+    route_e  = [x for x in ROUTE_ERRORS if f.get(x) == TRUE]
+    quality  = [x for x in QUALITY_STRICT
+                if f.get(x) == TRUE and x not in ack_suppressed]
+    soft     = [x for x in QUALITY_SOFT
+                if f.get(x) == TRUE and x not in ack_suppressed]
+    audit_e  = [f"AUDIT_ERROR: {x}" for x in errors]
+    val_e    = [f"VALIDATION: {x}" for x in issues]
+
+    # critical UNKNOWN on a complete trace also triggers review
     if f.get("AUDIT_TRACE_INCOMPLETE") == FALSE:
-        reasons += [f"{x}:UNKNOWN" for x in CRITICAL if f.get(x) == UNKNOWN]
-    reasons += [f"VALIDATION: {x}" for x in issues]
-    reasons += [f"AUDIT_ERROR: {x}" for x in errors]
-    low = [x for x in LOW_PRIORITY if f.get(x) == TRUE]
-    msg = ("Needs review: " + "; ".join(reasons)) if reasons else (
-        "No review needed" + (f" (minor: {', '.join(low)})" if low else ""))
-    return {"needs_review": bool(reasons), "reasons": reasons, "message": msg}
+        critical += [f"{x}:UNKNOWN" for x in CRITICAL
+                     if f.get(x) == UNKNOWN]
+
+    reasons  = critical + route_e + quality + audit_e + val_e
+    needs    = bool(reasons)
+    tier     = ("critical"    if critical else
+                "route_error" if route_e  else
+                "quality"     if quality  else
+                "soft"        if soft     else
+                "clean")
+    low      = [x for x in LOW_PRIORITY if f.get(x) == TRUE]
+    msg      = (("Needs review: " + "; ".join(reasons)) if needs
+                else ("Clean (soft: " + "; ".join(soft) + ")" if soft
+                      else ("Clean (minor: " + "; ".join(low) + ")"
+                            if low else "Clean")))
+    return {
+        "needs_review": needs, "tier": tier,
+        "reasons": reasons, "soft_flags": soft, "message": msg,
+    }
 
 
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# FINISH: assemble one output row
+# --------------------------------------------------------------------------
 def finish(st):
     route = st["route"]
-    f = st["flags"]
+    f     = st["flags"]
     f.update(derive(route, f))
     themes = themes_for(route, f)
-    cause = root_cause_for(route, f, themes)
+    cause  = root_cause_for(route, f, themes)
+    gap    = gap_type_for(route, f)
     issues = validate(f)
-    v = verdict(f, issues, st["errors"])
+    v      = verdict(f, issues, st["errors"], themes)
     row, c = st["row"], st["ctx"]
-    out = {"transaction_id": row["transaction_id"], "conversation_id": row["conversation_id"],
-           "request_created_on": row["request_created_on"], "request": row["request"],
-           "response": row["response"], "history_turns": len(c["history"]) // 2,
-           "route": route, "static": st["static"], "scope_category": f.get("SCOPE_CATEGORY"),
-           "theme": themes[0] if themes else None, "themes": "; ".join(themes),
-           "cause_stage": (cause or {}).get("stage"), "cause": (cause or {}).get("cause"),
-           "cause_owner": CAUSE_OWNER.get((cause or {}).get("cause"), ""),
-           "needs_review": v["needs_review"], "message": v["message"],
-           "errors": "; ".join(st["errors"]), "evidence_json": json.dumps(st["ev"], ensure_ascii=False)}
+
+    out = {
+        "transaction_id":     row["transaction_id"],
+        "conversation_id":    row["conversation_id"],
+        "request_created_on": row["request_created_on"],
+        "request":            row["request"],
+        "response":           row["response"],
+        "history_turns":      len(c["history"]) // 2,
+        "route":              route,
+        "static":             st["static"],
+        "scope_category":     f.get("SCOPE_CATEGORY"),
+        "themes":             "; ".join(themes),
+        "primary_theme":      themes[0] if themes else None,
+        "cause_stage":        (cause or {}).get("stage"),
+        "cause":              (cause or {}).get("cause"),
+        "cause_owner":        CAUSE_OWNER.get(
+                                  (cause or {}).get("cause"), ""),
+        "gap_type":           gap,
+        "needs_review":       v["needs_review"],
+        "tier":               v["tier"],
+        "soft_flags":         "; ".join(v["soft_flags"]),
+        "message":            v["message"],
+        "errors":             "; ".join(st["errors"]),
+        "evidence_json":      json.dumps(st["ev"], ensure_ascii=False),
+    }
     out.update({f"flag_{k}": val for k, val in f.items()})
     return out
 
 
 # COMMAND ----------
+# --------------------------------------------------------------------------
+# ORCHESTRATION
+# --------------------------------------------------------------------------
 def run_audit(path):
-    df = load(path)
-    hist = build_history(df)
-    templates = detect_static(df)
+    df           = load(path)
+    hist         = build_history(df)
+    static_ids, norm_map = tag_static(df)
+
     rows = df.to_dict("records")
+
+    # Phase A: request analysis in parallel (never sees response)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         states = list(ex.map(lambda r: phase_a(r, hist), rows))
-    phase_b(states, templates)
+
+    # Phase B: static tagging + twin matching (sequential, shared state)
+    phase_b(states, static_ids, norm_map)
+
+    # Phase C: evidence + response + behavior calls in parallel
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         states = list(ex.map(phase_c, states))
-    out = pd.DataFrame([finish(st) for st in states])
-    out.to_csv(OUTPUT_CSV, index=False)
-    n = int(out["needs_review"].sum())
-    print(f"audited {len(out)} rows, {n} need review ({n / max(len(out), 1):.0%}). Output: {OUTPUT_CSV}")
-    print(out["theme"].value_counts(dropna=True).to_string())
-    return out
+
+    result = pd.DataFrame([finish(st) for st in states])
+    result.to_csv(OUTPUT_CSV, index=False)
+
+    n    = int(result["needs_review"].sum())
+    tiers = result["tier"].value_counts()
+    print(f"\naudited {len(result)} rows — {n} need review "
+          f"({n / max(len(result), 1):.0%})")
+    print("tier breakdown:\n", tiers.to_string())
+    print("\ntheme counts:")
+    all_themes = [t for ts in result["themes"].dropna()
+                  for t in ts.split("; ") if t]
+    print(pd.Series(all_themes).value_counts().to_string())
+    print("\ncause breakdown:")
+    print(result["cause"].value_counts().to_string())
+    print("\ngap_type breakdown:")
+    print(result["gap_type"].value_counts(dropna=False).to_string())
+    print(f"\nOutput: {OUTPUT_CSV}")
+    return result
 
 
 result = run_audit(INPUT_CSV)
 
 # COMMAND ----------
-# Quick check: review queue, sorted so the most serious reasons come first
+# Review queue — most critical first
 try:
-    display(result[result["needs_review"]][["conversation_id", "request", "route", "themes", "cause", "message"]])
+    display(
+        result[result["needs_review"]]
+        .sort_values("tier", key=lambda s: s.map(
+            {"critical": 0, "route_error": 1, "quality": 2,
+             "soft": 3, "clean": 4}))
+        [["transaction_id", "conversation_id", "request", "route",
+          "primary_theme", "themes", "cause", "gap_type",
+          "tier", "message"]]
+    )
 except NameError:
-    print(result[result["needs_review"]][["conversation_id", "request", "route", "themes", "cause"]].head(20).to_string())
+    print(result[result["needs_review"]]
+          [["transaction_id", "request", "route",
+            "primary_theme", "cause", "tier"]].head(20).to_string())
+
+# COMMAND ----------
+# Corpus gap report — topics to add to the corpus
+corpus_gaps = result[result["gap_type"].isin(
+    ["corpus_gap_acknowledged", "corpus_gap_mishandled", "corpus_partial"])]
+if len(corpus_gaps) >= 5:
+    vec    = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+    k      = min(10, max(2, len(corpus_gaps) // 5))
+    labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(
+        vec.fit_transform(corpus_gaps["request"]))
+    terms  = np.array(vec.get_feature_names_out())
+    print("\nCorpus gap clusters (topics to add):")
+    M = vec.transform(corpus_gaps["request"])
+    for c in range(k):
+        mask = labels == c
+        if not mask.any():
+            continue
+        top  = terms[np.asarray(
+            M[mask].mean(axis=0)).ravel().argsort()[::-1][:6]]
+        exs  = corpus_gaps["request"].iloc[
+            np.where(mask)[0][:2]].tolist()
+        print(f"  cluster {c} (n={mask.sum()}): "
+              f"{', '.join(top)}\n    e.g. {exs}")
+else:
+    print(f"\n{len(corpus_gaps)} corpus gap rows "
+          f"(need >= 5 for clustering)")
