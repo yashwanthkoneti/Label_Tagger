@@ -31,12 +31,35 @@ CORPUS_INDEX = []            # policy titles. Strongly recommended: scope judgme
 ADJACENT_IS_IN_SCOPE = False # product decision: HR-flavoured questions no policy covers
 MAX_WORKERS = 8
 MAX_HISTORY_TURNS = 10       # most recent prior turns shown to the judge
-MAX_CHUNK_CHARS = 1500
-MAX_RESPONSE_CHARS = 1200
-STATIC_MIN_REPEAT = 3        # a response text repeated this often is treated as a static template
+MAX_TOTAL_CHUNK_CHARS = 6000 # total character budget across ALL chunks per call (not per chunk)
+MAX_RESPONSE_CHARS = 1200    # threshold for RESPONSE_EXCESSIVE_LENGTH code flag only; full response goes to judge
+STATIC_MIN_REPEAT = 5        # a response text repeated this often is treated as a static template
 TWIN_SIM_THRESHOLD = 0.6     # TF-IDF similarity needed before the judge confirms an answered twin
 
-llm = ChatDatabricks(endpoint=LLM_ENDPOINT, temperature=0.0, max_tokens=1024)
+# Completion token budget per call.
+# The response call carries 8 flags with evidence strings and is the most expensive.
+# Raise these if you see audit_error on truncated JSON; lower them if your endpoint has
+# a strict combined (prompt + completion) token limit.
+MAX_TOKENS = {
+    "request":  800,
+    "evidence": 600,
+    "response": 1500,
+    "behavior": 800,
+    "twin":     200,
+}
+
+# ChatDatabricks accepts max_tokens as a constructor arg in some versions and as an
+# invoke-time arg in others. We probe once at startup and pick the right path.
+def _make_llm(endpoint):
+    import inspect
+    sig = inspect.signature(ChatDatabricks.__init__)
+    if "max_tokens" in sig.parameters:
+        # pass a safe ceiling; per-call limits are enforced inside ask()
+        return ChatDatabricks(endpoint=endpoint, temperature=0.0, max_tokens=max(MAX_TOKENS.values()))
+    return ChatDatabricks(endpoint=endpoint, temperature=0.0)
+
+llm = _make_llm(LLM_ENDPOINT)
+_llm_max_tokens_in_constructor = "max_tokens" in __import__("inspect").signature(ChatDatabricks.__init__).parameters
 
 # COMMAND ----------
 TRUE, FALSE, UNKNOWN, NA = "TRUE", "FALSE", "UNKNOWN", "NOT_APPLICABLE"
@@ -246,9 +269,16 @@ def render(name, c):
     if name == "request":
         return f"## CURRENT USER REQUEST\n{c['request']}"
     if name == "chunks":
-        body = "\n\n".join(f"[chunk {i + 1} | {x['doc_title']}]\n{x['text'][:MAX_CHUNK_CHARS]}"
-                           for i, x in enumerate(c["chunks"]))
-        return "## RETRIEVED CHUNKS\n" + (body or "(none retrieved)")
+        budget, parts = MAX_TOTAL_CHUNK_CHARS, []
+        for i, x in enumerate(c["chunks"]):
+            if budget <= 0:
+                parts.append(f"[{len(c['chunks']) - i} further chunk(s) omitted: total budget exhausted. "
+                             f"Judge AUDIT_INPUT_LIMITED conservatively.]")
+                break
+            text = x["text"][:budget]        # never take more than what remains
+            parts.append(f"[chunk {i + 1} | {x['doc_title']}]\n{text}")
+            budget -= len(text)              # deduct what was actually taken
+        return "## RETRIEVED CHUNKS\n" + ("\n\n".join(parts) or "(none retrieved)")
     if name == "response":
         return f"## ASSISTANT RESPONSE\n{c['response']}"
     raise KeyError(name)
@@ -268,14 +298,22 @@ def build_prompt(name, c):
     return f"{PREAMBLE}\n\nFLAGS:\n{defs}{extra}\n\n{sections}\n\nReturn the JSON now."
 
 
-def ask(prompt):
-    """One LLM call returning parsed JSON. One retry on a malformed reply, then raises."""
+def ask(prompt, call_name="response"):
+    """One LLM call returning parsed JSON. One retry on a malformed reply, then raises.
+    Passes max_tokens at invoke time when the constructor does not accept it."""
+    tokens = MAX_TOKENS.get(call_name, 1000)
     last = None
-    for _ in range(2):
+    for attempt in range(2):
         try:
-            text = str(llm.invoke(prompt).content)
-            return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
-        except Exception as e:  # network, parse, or missing JSON
+            if _llm_max_tokens_in_constructor:
+                text = str(llm.invoke(prompt).content)
+            else:
+                text = str(llm.invoke(prompt, max_tokens=tokens).content)
+            match = re.search(r"\{.*\}", text, re.S)
+            if not match:
+                raise ValueError(f"no JSON object in reply (attempt {attempt + 1}); raw: {text[:200]!r}")
+            return json.loads(match.group(0))
+        except Exception as e:
             last = e
     raise RuntimeError(f"{type(last).__name__}: {last}")
 
@@ -289,7 +327,7 @@ def run_call(name, c, errors):
     if name == "response" and not ROUTE_IN_LOG:
         keys.append("ROUTE_OBSERVED")
     try:
-        data = ask(build_prompt(name, c))
+        data = ask(build_prompt(name, c), call_name=name)
     except Exception as e:
         errors.append(f"{name}: {e}")
         return {k: (UNKNOWN, "audit_error") for k in keys}
