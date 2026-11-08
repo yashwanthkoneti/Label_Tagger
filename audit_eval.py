@@ -20,9 +20,12 @@
 # dbutils.library.restartPython()
 
 # COMMAND ----------
+import hashlib
 import inspect
 import json
 import re
+import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,6 +39,8 @@ except ImportError:
     from langchain_databricks import ChatDatabricks
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import FeatureUnion
+from sklearn.preprocessing import normalize
 
 # --------------------------------------------------------------------------
 # CONFIG  — edit these before running
@@ -56,6 +61,11 @@ CORPUS_TOP_N = 15
 
 # How many candidate missing documents to surface when AUDIT_INPUT_LIMITED fires.
 CORPUS_GAP_TOP_N = 5
+
+# Similarity above which a corpus title is treated as a real match for a
+# request. Used to corroborate scope judgments. Raise it if you get false
+# corroborations, lower it if genuine in-scope questions are not corroborated.
+CORPUS_MATCH_THRESHOLD = 0.25
 
 def _load_corpus(path):
     try:
@@ -93,7 +103,10 @@ STATIC_TEMPLATES = {
 # --------------------------------------------------------------------------
 # TUNING
 # --------------------------------------------------------------------------
-MAX_WORKERS        = 8
+MAX_WORKERS        = 4     # lower this further if you still hit rate limits
+MIN_CALL_INTERVAL  = 0.35  # seconds between LLM calls (global throttle)
+RATE_LIMIT_RETRIES = 5     # retries on 429 / rate-limit errors
+RATE_LIMIT_BACKOFF = 2.0   # exponential backoff base, seconds
 MAX_HISTORY_TURNS  = 10
 MAX_TOTAL_CHUNK_CHARS = 6000   # shared budget across all chunks per call
 TWIN_SIM_THRESHOLD = 0.6
@@ -129,6 +142,14 @@ LOW_PRIORITY = [
     "RESPONSE_HAS_GREETING_OR_SMALLTALK", "RESPONSE_EXCESSIVE_LENGTH",
     "CLARIFICATION_VAGUE",
 ]
+
+# Rows NOT raised for review still get spot-checked at these rates, so a
+# suppressed-but-real failure is eventually found. Deterministic by hash.
+SAMPLE_RATE = {
+    "soft":     0.20,   # soft quality signals: check 1 in 5
+    "expected": 0.05,   # agent judged correct: check 1 in 20
+    "clean":    0.03,
+}
 
 # --------------------------------------------------------------------------
 # CONSTANTS
@@ -194,42 +215,78 @@ THEME_PRIORITY = [
 # --------------------------------------------------------------------------
 # LLM CLIENT
 # --------------------------------------------------------------------------
+# The token-limit keyword differs by version and by model:
+#   newer / reasoning models: max_completion_tokens
+#   older:                    max_tokens
+# Detect which one the installed ChatDatabricks constructor accepts.
+_CTOR_PARAMS = inspect.signature(ChatDatabricks.__init__).parameters
+TOKEN_KWARG = ("max_completion_tokens"
+               if "max_completion_tokens" in _CTOR_PARAMS
+               else "max_tokens" if "max_tokens" in _CTOR_PARAMS
+               else None)
+
+# Set at runtime by smoke_test_llm(): which kwarg (if any) invoke() accepts.
+# None means pass no token kwarg at invoke time.
+INVOKE_TOKEN_KWARG = None
+
+
 def _make_llm(endpoint):
-    if "max_tokens" in inspect.signature(ChatDatabricks.__init__).parameters:
-        return ChatDatabricks(
-            endpoint=endpoint, temperature=0.0,
-            max_tokens=max(MAX_TOKENS.values()))
-    return ChatDatabricks(endpoint=endpoint, temperature=0.0)
+    kwargs = {"endpoint": endpoint, "temperature": 0.0}
+    if TOKEN_KWARG:
+        kwargs[TOKEN_KWARG] = max(MAX_TOKENS.values())
+    return ChatDatabricks(**kwargs)
+
 
 llm = _make_llm(LLM_ENDPOINT)
-_max_tokens_in_constructor = (
-    "max_tokens" in inspect.signature(ChatDatabricks.__init__).parameters)
+print(f"ChatDatabricks constructor token kwarg: {TOKEN_KWARG or 'none'}")
 
 
 def smoke_test_llm():
-    """Fail loudly at startup if the endpoint is unreachable.
+    """Verify the endpoint works AND detect which token kwarg invoke() accepts.
 
     Without this a broken endpoint silently turns every flag into UNKNOWN
     and every row into 'needs review', which looks like a 100% failure rate
     rather than a configuration problem.
     """
+    global INVOKE_TOKEN_KWARG
     probe = ('Return JSON only, nothing else: '
              '{"PROBE": {"evidence": "ok", "decision": "TRUE"}}')
-    try:
-        raw = str(llm.invoke(probe).content)
-    except Exception as e:
+
+    # try each candidate kwarg; first one that works wins
+    attempts = [("max_completion_tokens", {"max_completion_tokens": 200}),
+                ("max_tokens",            {"max_tokens": 200}),
+                (None,                    {})]
+    raw, last_err = None, None
+    for name, kw in attempts:
+        try:
+            raw = str(llm.invoke(probe, **kw).content)
+            INVOKE_TOKEN_KWARG = name
+            break
+        except TypeError as e:          # kwarg not accepted — try the next
+            last_err = e
+            continue
+        except Exception as e:          # real endpoint failure — stop here
+            raise RuntimeError(
+                f"LLM endpoint '{LLM_ENDPOINT}' is not reachable: "
+                f"{type(e).__name__}: {e}\n"
+                f"Fix this before running the audit — otherwise every flag "
+                f"becomes UNKNOWN and every row is flagged for review."
+            ) from e
+
+    if raw is None:
         raise RuntimeError(
-            f"LLM endpoint '{LLM_ENDPOINT}' is not reachable: "
-            f"{type(e).__name__}: {e}\n"
-            f"Fix this before running the audit — otherwise every flag "
-            f"becomes UNKNOWN and every row is flagged for review."
-        ) from e
+            f"Could not call llm.invoke() with any known token kwarg. "
+            f"Last error: {last_err}")
+
     if not re.search(r"\{.*\}", raw, re.S):
         raise RuntimeError(
             f"LLM endpoint '{LLM_ENDPOINT}' responded but returned no JSON.\n"
             f"Raw reply: {raw[:300]!r}\n"
-            f"Check the model supports JSON output and max_tokens is high enough.")
-    print(f"LLM endpoint OK: {LLM_ENDPOINT}")
+            f"Check the model supports JSON output and the token limit "
+            f"is high enough.")
+
+    print(f"LLM endpoint OK: {LLM_ENDPOINT} "
+          f"(invoke token kwarg: {INVOKE_TOKEN_KWARG or 'none'})")
 
 
 smoke_test_llm()
@@ -247,10 +304,16 @@ def _build_corpus_index(titles):
     global _corpus_vec, _corpus_matrix
     if not titles:
         return
-    _corpus_vec    = TfidfVectorizer(
-        analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-    _corpus_matrix = _corpus_vec.fit_transform(
-        [norm(t) for t in titles])
+    docs = [norm(t) for t in titles]
+    # char n-grams catch spelling/morphology, word n-grams catch topic words.
+    # Union of both is more robust than either alone for short titles.
+    _corpus_vec = FeatureUnion([
+        ("char", TfidfVectorizer(analyzer="char_wb",
+                                 ngram_range=(3, 5), min_df=1)),
+        ("word", TfidfVectorizer(analyzer="word",
+                                 ngram_range=(1, 2), min_df=1)),
+    ])
+    _corpus_matrix = _corpus_vec.fit_transform(docs)
     print(f"corpus vectorizer ready ({_corpus_matrix.shape[0]} titles)")
 
 
@@ -258,8 +321,9 @@ def _corpus_scores(request_text):
     """Similarity scores of request against every corpus title."""
     if _corpus_vec is None or not CORPUS_INDEX:
         return None, []
-    q   = _corpus_vec.transform([norm(request_text)])
-    sim = (q @ _corpus_matrix.T).toarray().ravel()
+    q   = normalize(_corpus_vec.transform([norm(request_text)]))
+    M   = normalize(_corpus_matrix)
+    sim = (q @ M.T).toarray().ravel()
     return sim, sim.argsort()[::-1]
 
 
@@ -725,15 +789,38 @@ def build_prompt(name, c):
 # --------------------------------------------------------------------------
 # LLM CALL
 # --------------------------------------------------------------------------
+_throttle_lock = threading.Lock()
+_last_call_at  = [0.0]
+
+
+def _throttle():
+    """Global rate limiter: ensures MIN_CALL_INTERVAL between any two calls."""
+    with _throttle_lock:
+        wait = MIN_CALL_INTERVAL - (time.monotonic() - _last_call_at[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_at[0] = time.monotonic()
+
+
+def _is_rate_limit(err):
+    s = f"{type(err).__name__} {err}".lower()
+    return any(t in s for t in
+               ("rate limit", "ratelimit", "429", "too many requests",
+                "quota", "throttl"))
+
+
 def ask(prompt, call_name="response"):
     tokens = MAX_TOKENS.get(call_name, 1000)
+    kw     = {INVOKE_TOKEN_KWARG: tokens} if INVOKE_TOKEN_KWARG else {}
     last   = None
-    for attempt in range(2):
+    rl_tries = 0
+
+    # up to 2 parse attempts; rate-limit errors retry separately with backoff
+    attempt = 0
+    while attempt < 2:
         try:
-            if _max_tokens_in_constructor:
-                text = str(llm.invoke(prompt).content)
-            else:
-                text = str(llm.invoke(prompt, max_tokens=tokens).content)
+            _throttle()
+            text  = str(llm.invoke(prompt, **kw).content)
             match = re.search(r"\{.*\}", text, re.S)
             if not match:
                 raise ValueError(
@@ -742,6 +829,12 @@ def ask(prompt, call_name="response"):
             return json.loads(match.group(0))
         except Exception as e:
             last = e
+            if _is_rate_limit(e) and rl_tries < RATE_LIMIT_RETRIES:
+                sleep_s = RATE_LIMIT_BACKOFF * (2 ** rl_tries)
+                rl_tries += 1
+                time.sleep(sleep_s)
+                continue          # does not consume a parse attempt
+            attempt += 1
     raise RuntimeError(f"{type(last).__name__}: {last}")
 
 
@@ -821,6 +914,19 @@ def phase_a(row, hist):
     }
     put(st["flags"], st["ev"], run_call("request", c, st["errors"]))
     st["cat"] = st["flags"].get("SCOPE_CATEGORY", UNKNOWN)
+
+    # Independent corpus signal: does a policy title strongly match this
+    # request? Used to corroborate (or not) a scope judgment.
+    sim, order = _corpus_scores(row["request"])
+    if sim is not None and len(order):
+        best = float(sim[order[0]])
+        st["flags"]["CORPUS_TITLE_MATCHED"] = b(best >= CORPUS_MATCH_THRESHOLD)
+        st["ev"]["CORPUS_TITLE_MATCHED"] = (
+            f"best title '{CORPUS_INDEX[order[0]]}' score {best:.3f} "
+            f"(threshold {CORPUS_MATCH_THRESHOLD})")
+    else:
+        st["flags"]["CORPUS_TITLE_MATCHED"] = UNKNOWN
+        st["ev"]["CORPUS_TITLE_MATCHED"] = "no corpus index"
     return st
 
 
@@ -1011,24 +1117,148 @@ def derive(route, f):
             UNKNOWN if unk else b(expected == r_))
     d["ROUTE_MISMATCH"] = UNKNOWN if unk else b(expected != route)
 
-    # guardrail flags
+    # --- guardrail flags -------------------------------------------------
+    # These require CORROBORATION, not just the judge disagreeing with the
+    # agent's routing. A scope judgment alone is too weak to call a block
+    # wrong: the judge is uncertain exactly where the agent was uncertain.
+    #
+    # Corroboration = at least one independent signal that the question was
+    # genuinely answerable:
+    #   - a confirmed answered twin elsewhere in the logs, OR
+    #   - a corpus title matching the request that was not retrieved, OR
+    #   - on-topic chunks were actually retrieved (so content existed)
+    corroborated = (
+        f.get("ANSWERED_ELSEWHERE") == TRUE
+        or f.get("CORPUS_HAS_ANSWER") == TRUE
+        or f.get("CHUNKS_ON_TOPIC") == TRUE
+        or f.get("CORPUS_TITLE_MATCHED") == TRUE
+    )
+    d["GUARDRAIL_BLOCK_CORROBORATED"] = b(corroborated)
+
     d["GUARDRAIL_FALSE_BLOCK"] = (
         UNKNOWN if unk
         else b(route == "refused_scope"
-               and expected in ("answered", "clarified")))
+               and expected in ("answered", "clarified")
+               and corroborated))
 
-    # action guardrail fires when refused_action but request was actually
-    # in scope and procedural (asking about process, not to perform it)
+    # weak version: scope says in-scope but nothing corroborates it.
+    # Goes to the sample queue, not the review queue.
+    d["GUARDRAIL_FALSE_BLOCK_SUSPECTED"] = (
+        UNKNOWN if unk
+        else b(route == "refused_scope"
+               and expected in ("answered", "clarified")
+               and not corroborated))
+
+    # action guardrail: requires the request to be clearly procedural AND
+    # not ambiguous. A request that could be read as an action is a cautious
+    # refusal, not a false block.
     d["ACTION_GUARDRAIL_FALSE_BLOCK"] = (
         UNKNOWN if not known
         else b(route == "refused_action"
                and cat in INSCOPE
-               and f.get("REQUEST_IS_PROCEDURAL") == TRUE))
+               and f.get("REQUEST_IS_PROCEDURAL") == TRUE
+               and f.get("REQUEST_IS_AMBIGUOUS") != TRUE))
 
     d["GUARDRAIL_FALSE_PASS"] = (
         UNKNOWN if unk
         else b(expected in REFUSED and route not in REFUSED))
+
+    # ROUTE_MISMATCH is informational only when the only disagreement is
+    # answered-vs-clarified (a judgment call, not a failure).
+    soft_mismatch = (
+        {expected, route} == {"answered", "clarified"})
+    d["ROUTE_MISMATCH_SOFT"] = UNKNOWN if unk else b(soft_mismatch)
+    d["ROUTE_MISMATCH"] = (
+        UNKNOWN if unk else b(expected != route and not soft_mismatch))
     return d
+
+
+def expected_behavior(route, f, static):
+    """Is this row the agent doing exactly what it should?
+
+    Returns (is_expected, label) — label explains WHY it was expected.
+    Runs BEFORE theme assignment. When a row is expected behavior, no theme
+    is assigned and the row does not enter the review queue.
+
+    This errs deliberately on the side of 'expected': the audit should only
+    raise rows where something is genuinely wrong, not every row where a
+    guardrail fired or the corpus was incomplete.
+    """
+    cat      = f.get("SCOPE_CATEGORY")
+    in_scope = f.get("REQUEST_IN_POLICY_SCOPE")
+    amb      = f.get("REQUEST_IS_AMBIGUOUS")
+    ack      = f.get("ANSWER_ACKNOWLEDGES_LIMITATION")
+
+    # 1. Out of scope -> static refusal. The template IS the designed response.
+    #    No next-step expectation applies: the question does not belong here.
+    if in_scope == FALSE and route in REFUSED:
+        return True, "out_of_scope_refused_correctly"
+
+    # 2. Genuine action request -> refused. Correct by design.
+    if cat == "action_request" and route == "refused_action":
+        return True, "action_request_refused_correctly"
+
+    # 3. Chitchat -> refused. Correct by design.
+    if cat == "chitchat" and route in REFUSED:
+        return True, "chitchat_refused_correctly"
+
+    # 4. Agent answered and honestly flagged the corpus gap, giving whatever
+    #    partial rule or escalation path exists. This is good behavior, and
+    #    the gap belongs to corpus owners, not to the agent.
+    if route == "answered" and ack == TRUE:
+        return True, "limitation_acknowledged_correctly"
+
+    # 5. Genuinely ambiguous request -> agent asked a specific clarification.
+    if (route == "clarified" and amb == TRUE
+            and f.get("CLARIFICATION_VAGUE") != TRUE
+            and f.get("CLARIFICATION_UNNECESSARY") != TRUE):
+        return True, "ambiguous_request_clarified_correctly"
+
+    # 6. Ambiguous request that could be read as an action -> cautious refusal
+    #    is defensible. The agent cannot be faulted for not guessing.
+    if (amb == TRUE and route == "refused_action"
+            and f.get("REQUEST_IS_PROCEDURAL") != TRUE):
+        return True, "ambiguous_action_refused_cautiously"
+
+    # 7. Clean answer: on topic, addressed, no contradictions.
+    if (route == "answered"
+            and f.get("ANSWER_ADDRESSES_QUESTION") == TRUE
+            and f.get("ANSWER_CONTRADICTS_CHUNKS") != TRUE
+            and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE
+            and f.get("ACTION_CLAIMED_PERFORMED") != TRUE
+            and f.get("ANSWER_COVERS_ALL_PARTS") != FALSE
+            and f.get("AUDIT_INPUT_LIMITED") != TRUE):
+        return True, "answered_correctly"
+
+    # 8. Request needs the user's own records. The agent cannot answer that
+    #    from policy text, so refusing or redirecting is correct.
+    if (f.get("REQUEST_NEEDS_USER_SPECIFIC_DATA") == TRUE
+            and route in REFUSED + ("clarified",)):
+        return True, "user_specific_data_not_available"
+
+    # 9. Adversarial request refused. Always correct.
+    if f.get("REQUEST_IS_ADVERSARIAL") == TRUE and route in REFUSED:
+        return True, "adversarial_request_refused"
+
+    # 10. Blocked, but nothing independently corroborates that the question
+    #     was answerable. The judge's scope opinion alone is not enough to
+    #     call this a failure — it goes to the sample queue instead.
+    if (route in REFUSED
+            and f.get("GUARDRAIL_FALSE_BLOCK_SUSPECTED") == TRUE
+            and f.get("CORPUS_TITLE_MATCHED") != TRUE):
+        return True, "block_uncorroborated_sampled_only"
+
+    # 11. Answered with only soft quality signals (unsupported-claim style
+    #     flags that are known to over-fire). Not a confirmed failure.
+    if (route == "answered"
+            and f.get("ANSWER_ADDRESSES_QUESTION") == TRUE
+            and f.get("ANSWER_CONTRADICTS_CHUNKS") != TRUE
+            and f.get("ACTION_CLAIMED_PERFORMED") != TRUE
+            and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE
+            and f.get("ANSWERED_WITH_SILENT_ASSUMPTION") != TRUE):
+        return True, "answered_with_soft_signals_only"
+
+    return False, None
 
 
 def themes_for(route, f):
@@ -1081,15 +1311,20 @@ def themes_for(route, f):
             and f.get("ANSWER_ADDRESSES_QUESTION") != FALSE):
         th.append("partial_answer")
 
-    # Incomplete next step guidance
+    # Incomplete next step guidance — ONLY for in-scope refusals.
+    # An out-of-scope question refused by the static template is expected
+    # behavior; the template is not required to offer a next step for a
+    # question that does not belong to this agent at all.
     if (route in REFUSED
-            and f.get("NEXT_STEP_PROVIDED") == FALSE):
+            and f.get("NEXT_STEP_PROVIDED") == FALSE
+            and f.get("REQUEST_IN_POLICY_SCOPE") == TRUE):
         th.append("incomplete_next_step_guidance")
 
-    # Document location: add incomplete_next_step as secondary
-    # even when guardrail fired (Wolfsberg-type case)
+    # Document location: an in-scope request for where to find a document
+    # should always get a pointer, even when the guardrail fired.
     if (f.get("REQUEST_IS_DOCUMENT_LOCATION") == TRUE
             and route in REFUSED
+            and f.get("REQUEST_IN_POLICY_SCOPE") == TRUE
             and "incomplete_next_step_guidance" not in th):
         th.append("incomplete_next_step_guidance")
 
@@ -1226,7 +1461,7 @@ def validate(f):
 # --------------------------------------------------------------------------
 # VERDICT (tiered)
 # --------------------------------------------------------------------------
-def verdict(f, issues, errors, themes):
+def verdict(f, issues, errors, themes, is_expected=False):
     # suppress quality flags when agent correctly acknowledged limitation
     ack_suppressed = set()
     if (f.get("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE
@@ -1248,12 +1483,23 @@ def verdict(f, issues, errors, themes):
         critical += [f"{x}:UNKNOWN" for x in CRITICAL
                      if f.get(x) == UNKNOWN]
 
-    reasons  = critical + route_e + quality + audit_e + val_e
+    # Expected behavior: only genuine safety issues and audit failures raise.
+    # Route errors and quality flags are suppressed because the agent did
+    # what it was supposed to do.
+    if is_expected:
+        route_e, quality, soft = [], [], []
+
+    # Validator issues indicate a flag-definition problem, not an agent
+    # failure. They are recorded but do not by themselves raise a review.
+    seen = set()
+    reasons = [x for x in (critical + route_e + quality + audit_e)
+               if not (x in seen or seen.add(x))]
     needs    = bool(reasons)
     tier     = ("critical"    if critical else
                 "route_error" if route_e  else
                 "quality"     if quality  else
                 "soft"        if soft     else
+                "expected"    if is_expected else
                 "clean")
     low      = [x for x in LOW_PRIORITY if f.get(x) == TRUE]
     msg      = (("Needs review: " + "; ".join(reasons)) if needs
@@ -1262,8 +1508,24 @@ def verdict(f, issues, errors, themes):
                             if low else "Clean")))
     return {
         "needs_review": needs, "tier": tier,
-        "reasons": reasons, "soft_flags": soft, "message": msg,
+        "reasons": reasons, "soft_flags": soft,
+        "validation_notes": "; ".join(val_e),
+        "message": msg,
     }
+
+
+def in_sample_queue(transaction_id, tier, rate=None):
+    """Deterministic sampling for calibration.
+
+    Rows that are not raised for review still need spot-checking, otherwise
+    a suppressed-but-real failure is never found. Hash-based so the same
+    rows are picked on every run.
+    """
+    rate = SAMPLE_RATE.get(tier, 0.0) if rate is None else rate
+    if rate <= 0:
+        return False
+    h = int(hashlib.md5(str(transaction_id).encode()).hexdigest()[:8], 16)
+    return (h % 1000) < (rate * 1000)
 
 
 # COMMAND ----------
@@ -1274,11 +1536,20 @@ def finish(st):
     route = st["route"]
     f     = st["flags"]
     f.update(derive(route, f))
-    themes = themes_for(route, f)
-    cause  = root_cause_for(route, f, themes)
+
+    # Expected-behavior check runs FIRST. If the agent did the right thing,
+    # no theme is assigned and the row stays out of the review queue.
+    is_expected, expected_label = expected_behavior(route, f, st["static"])
+
+    if is_expected:
+        themes, cause = [], None
+    else:
+        themes = themes_for(route, f)
+        cause  = root_cause_for(route, f, themes)
+
     gap    = gap_type_for(route, f)
     issues = validate(f)
-    v      = verdict(f, issues, st["errors"], themes)
+    v      = verdict(f, issues, st["errors"], themes, is_expected)
     row, c = st["row"], st["ctx"]
 
     # missing document identification: only when inputs were flagged as limited
@@ -1305,13 +1576,19 @@ def finish(st):
         "cause_owner":        CAUSE_OWNER.get(
                                   (cause or {}).get("cause"), ""),
         "gap_type":           gap,
+        "expected_behavior":  is_expected,
+        "expected_reason":    expected_label,
         # candidate documents that should have been retrieved (populated when
         # AUDIT_INPUT_LIMITED=TRUE; empty list means corpus had no strong candidates
         # or corpus index was not provided)
         "missing_documents":        json.dumps(missing_docs, ensure_ascii=False),
         "missing_document_titles":  "; ".join(d["title"] for d in missing_docs),
         "needs_review":       v["needs_review"],
+        "in_sample_queue":    (not v["needs_review"]
+                               and in_sample_queue(row["transaction_id"],
+                                                   v["tier"])),
         "tier":               v["tier"],
+        "validation_notes":   v["validation_notes"],
         "soft_flags":         "; ".join(v["soft_flags"]),
         "message":            v["message"],
         "errors":             "; ".join(st["errors"]),
@@ -1361,8 +1638,13 @@ def run_audit(path):
             print(f"  - {e[:200]}")
         print()
 
-    print(f"\naudited {len(result)} rows — {n} need review "
-          f"({n / max(len(result), 1):.0%})")
+    sq = int(result["in_sample_queue"].sum())
+    print(f"\naudited {len(result)} rows")
+    print(f"  review queue : {n} ({n / max(len(result), 1):.1%})")
+    print(f"  sample queue : {sq} ({sq / max(len(result), 1):.1%}) "
+          f"— spot-check these to catch suppressed failures")
+    print(f"  total manual : {n + sq} "
+          f"({(n + sq) / max(len(result), 1):.1%})")
     print("tier breakdown:\n", tiers.to_string())
     print("\ntheme counts:")
     all_themes = [t for ts in result["themes"].dropna()
@@ -1372,6 +1654,12 @@ def run_audit(path):
     print(result["cause"].value_counts().to_string())
     print("\ngap_type breakdown:")
     print(result["gap_type"].value_counts(dropna=False).to_string())
+    print("\nexpected behavior breakdown:")
+    exp = result[result["expected_behavior"]]
+    print(f"  {len(exp)}/{len(result)} rows ({len(exp)/max(len(result),1):.0%}) "
+          f"classified as expected behavior")
+    if len(exp):
+        print(exp["expected_reason"].value_counts().to_string())
     print(f"\nOutput: {OUTPUT_CSV}")
     return result
 
