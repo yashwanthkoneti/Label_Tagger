@@ -23,6 +23,7 @@
 import hashlib
 import inspect
 import json
+import os
 import re
 import threading
 import time
@@ -48,6 +49,12 @@ from sklearn.preprocessing import normalize
 INPUT_CSV  = "/Volumes/<catalog>/<schema>/<volume>/traces.csv"
 OUTPUT_CSV = "/Volumes/<catalog>/<schema>/<volume>/audit_output.csv"
 LLM_ENDPOINT = "<your-databricks-serving-endpoint>"
+
+# Finished rows are appended here as the run proceeds, so a failure or a
+# detached notebook does not cost the rows already paid for. Rerunning
+# run_audit() skips anything already in this file. Set to None to disable.
+CHECKPOINT_PATH = "/Volumes/<catalog>/<schema>/<volume>/audit_checkpoint.jsonl"
+BATCH_SIZE      = 25    # rows per checkpoint write
 
 # List every policy title / section so scope judgments use the actual corpus,
 # not topic feel. Leave empty only if you have no index yet.
@@ -203,6 +210,9 @@ CAUSE_OWNER = {
     "refused_answerable_generally":        "guardrail / prompt",
     "scope_definition_too_narrow":         "guardrail / scope definition",
     "no_next_step_in_template":            "static response design",
+    "clarified_though_chunks_resolved_it": "routing prompt",
+    "clarified_on_stale_context":          "conversation memory",
+    "clarified_though_request_was_clear":  "routing prompt",
     "prompt_or_routing":                   "prompt / routing",
     "generation_or_communication":         "response prompt",
     "acknowledged_limitation_correctly":   "corpus owners",
@@ -440,6 +450,10 @@ CALLS = {
                 "needs, so asking the user for it again would be unnecessary.",
                 "FALSE: the history does not contain what this request needs, or there is no history. "
                 "Do not mark TRUE just because history exists."),
+            "REQUEST_IS_TOPIC_CHANGE": (
+                "TRUE: this request moves to a new subject and stands on its own. It does not "
+                "depend on the earlier turns, so prior context is not needed to answer it.",
+                "FALSE: it continues the previous subject, or there is no history."),
         },
         "examples": [
             "'Cancel my leave for Friday.' -> action_request, REQUEST_IS_PROCEDURAL=FALSE",
@@ -480,6 +494,14 @@ CALLS = {
                 "TRUE: chunks apply to a different region, role, plan or period than the user's, "
                 "as stated in the request or history.",
                 "FALSE: they apply, or the user's situation is not stated."),
+            "CHUNKS_RESOLVE_AMBIGUITY": (
+                "TRUE: if the request could be read more than one way, the retrieved chunks "
+                "settle which reading applies — only one of the possible topics has a policy "
+                "here, or one rule in the chunks covers every reading, so the answer would be "
+                "the same either way.",
+                "FALSE: the chunks leave the ambiguity open — several readings each have a "
+                "different rule in the chunks — or there are no chunks. Also FALSE when the "
+                "request was never ambiguous."),
         },
     },
     "response": {
@@ -1338,6 +1360,26 @@ def derive(route, f):
     return d
 
 
+def clarification_sources(route, f):
+    """For a clarification row: which of the three sources was already clear.
+
+    Clarifying is justified only when all three are unclear. Returned so a
+    reviewer can check the verdict without re-reading the transcript.
+    """
+    if route != "clarified":
+        return "", ""
+    clear, unclear = [], []
+    (clear if f.get("REQUEST_IS_AMBIGUOUS") == FALSE
+     else unclear).append("request")
+    (clear if f.get("HISTORY_HAS_NEEDED_INFO") == TRUE
+     else unclear).append("history")
+    (clear if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE
+     else unclear).append("chunks")
+    if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
+        clear.append("topic_change")
+    return "; ".join(clear), "; ".join(unclear)
+
+
 def expected_behavior(route, f, static):
     """Is this row the agent doing exactly what it should?
 
@@ -1373,11 +1415,14 @@ def expected_behavior(route, f, static):
     if route == "answered" and ack == TRUE:
         return True, "limitation_acknowledged_correctly"
 
-    # 5. Genuinely ambiguous request -> agent asked a specific clarification.
+    # 5. Clarification is correct only when ALL THREE sources were unclear:
+    #    the request itself, the history, and the retrieved chunks.
     if (route == "clarified" and amb == TRUE
-            and f.get("CLARIFICATION_VAGUE") != TRUE
-            and f.get("CLARIFICATION_UNNECESSARY") != TRUE):
-        return True, "ambiguous_request_clarified_correctly"
+            and f.get("HISTORY_HAS_NEEDED_INFO") != TRUE
+            and f.get("CHUNKS_RESOLVE_AMBIGUITY") != TRUE
+            and f.get("REQUEST_IS_TOPIC_CHANGE") != TRUE
+            and f.get("CLARIFICATION_VAGUE") != TRUE):
+        return True, "all_sources_unclear_clarified_correctly"
 
     # 6. Ambiguous request that could be read as an action -> cautious refusal
     #    is defensible. The agent cannot be faulted for not guessing.
@@ -1433,16 +1478,33 @@ def themes_for(route, f):
                 f.get("ACTION_GUARDRAIL_FALSE_BLOCK")):
         th.append("excessive_guardrail")
 
-    # Context continuity failure: only when history actually had the needed info
-    if (route == "clarified"
-            and f.get("HISTORY_HAS_NEEDED_INFO") == TRUE):
-        th.append("context_continuity_failure")
+    # --- clarification: the three-source rule --------------------------
+    # Asking the user is justified ONLY when all three sources are unclear:
+    #   1. the request itself is ambiguous
+    #   2. the history does not resolve it
+    #   3. the retrieved chunks do not resolve it
+    # If ANY ONE of them is clear, the agent had what it needed and the
+    # clarification was unnecessary.
+    if route == "clarified":
+        resolved_by = []
+        if f.get("REQUEST_IS_AMBIGUOUS") == FALSE:
+            resolved_by.append("request_was_clear")
+        if f.get("HISTORY_HAS_NEEDED_INFO") == TRUE:
+            resolved_by.append("history_had_it")
+        if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
+            resolved_by.append("chunks_resolved_it")
+        # a topic change stands on its own: prior context is not needed,
+        # so clarifying "about what?" against old context is unnecessary
+        if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
+            resolved_by.append("self_contained_new_topic")
 
-    # Unnecessary clarification (not driven by history gap)
-    if (route == "clarified"
-            and f.get("EXPECTED_ROUTE") == "answered"
-            and f.get("HISTORY_HAS_NEEDED_INFO") != TRUE):
-        th.append("unnecessary_clarification")
+        if resolved_by:
+            # history specifically is a continuity failure, which points at
+            # conversation memory rather than at the routing prompt
+            if "history_had_it" in resolved_by:
+                th.append("context_continuity_failure")
+            else:
+                th.append("unnecessary_clarification")
 
     # Ambiguous user context: only when agent answered despite ambiguity
     # OR when it asked a vague clarification. NOT when it correctly clarified.
@@ -1587,6 +1649,16 @@ def root_cause_for(route, f, themes):
             return {"stage": "decision",
                     "cause": "refused_answerable_generally"}
         return {"stage": "decision", "cause": "prompt_or_routing"}
+
+    if "unnecessary_clarification" in themes:
+        if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
+            return {"stage": "decision",
+                    "cause": "clarified_though_chunks_resolved_it"}
+        if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
+            return {"stage": "request_understanding",
+                    "cause": "clarified_on_stale_context"}
+        return {"stage": "decision",
+                "cause": "clarified_though_request_was_clear"}
 
     if "incomplete_next_step_guidance" in themes:
         return {"stage": "decision", "cause": "no_next_step_in_template"}
@@ -1760,6 +1832,7 @@ def finish(st):
         cause  = root_cause_for(route, f, themes)
 
     gap    = gap_type_for(route, f)
+    clear_src, unclear_src = clarification_sources(route, f)
     issues = validate(f)
     v      = verdict(f, issues, st["errors"], themes, is_expected)
     row, c = st["row"], st["ctx"]
@@ -1788,6 +1861,10 @@ def finish(st):
         "cause_owner":        CAUSE_OWNER.get(
                                   (cause or {}).get("cause"), ""),
         "gap_type":           gap,
+        # clarification rows: which of request/history/chunks was already
+        # clear. Non-empty means clarifying was unnecessary.
+        "clarify_sources_clear":   clear_src,
+        "clarify_sources_unclear": unclear_src,
         "expected_behavior":  is_expected,
         "expected_reason":    expected_label,
         # candidate documents that should have been retrieved (populated when
@@ -1824,26 +1901,135 @@ def finish(st):
 # --------------------------------------------------------------------------
 # ORCHESTRATION
 # --------------------------------------------------------------------------
-def run_audit(path):
+def estimate_tokens(path, sample=20):
+    """Rough token cost and runtime for a full run, measured on a sample.
+
+    Databricks has no 'remaining tokens' counter: the limit is a RATE
+    (tokens per minute). Compare the tokens/min printed here against your
+    endpoint's cap under Serving -> your endpoint -> Settings, and raise
+    MIN_CALL_INTERVAL until you fit under it.
+    """
+    df   = load(path)
+    hist = build_history(df)
+    rows = df.to_dict("records")[:sample]
+    chars = 0
+    for r in rows:
+        c = ctx_of(r, hist)
+        for call in ("request", "evidence", "response"):
+            chars += len(build_prompt(call, c)) + MAX_TOKENS[call] * 4
+    per_row  = (chars / 4) / max(len(rows), 1)      # ~4 chars per token
+    n        = len(df)
+    calls    = n * 3
+    runtime  = calls * MIN_CALL_INTERVAL / 60
+    print(f"~{per_row:,.0f} tokens/row  |  {n} rows -> ~{per_row*n:,.0f} tokens")
+    print(f"~{runtime:.0f} min at MIN_CALL_INTERVAL={MIN_CALL_INTERVAL}s, "
+          f"MAX_WORKERS={MAX_WORKERS}")
+    print(f"~{per_row*n/max(runtime,1e-9):,.0f} tokens/min — compare to your "
+          f"endpoint's rate limit")
+    return per_row
+
+
+def _done_ids():
+    """Transaction ids already written to the checkpoint."""
+    if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
+        return set()
+    done = set()
+    with open(CHECKPOINT_PATH) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                done.add(str(json.loads(line)["transaction_id"]))
+            except Exception:
+                continue          # skip a half-written final line
+    return done
+
+
+def _append_checkpoint(records):
+    if not CHECKPOINT_PATH:
+        return
+    os.makedirs(os.path.dirname(CHECKPOINT_PATH) or ".", exist_ok=True)
+    with open(CHECKPOINT_PATH, "a") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec, default=str) + "\n")
+
+
+def _read_checkpoint():
+    if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
+        return []
+    out = []
+    with open(CHECKPOINT_PATH) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    return out
+
+
+def run_audit(path, resume=True):
+    """Audit every row, writing finished rows to a checkpoint as it goes.
+
+    A long run can die partway: rate limits, a cluster restart, a detached
+    notebook. With a checkpoint, rerunning picks up where it stopped instead
+    of repaying for the rows already done. Set resume=False to start over.
+    """
     df           = load(path)
     hist         = build_history(df)
     static_ids, norm_map = tag_static(df)
 
-    rows = df.to_dict("records")
+    if not resume and CHECKPOINT_PATH and os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+        print("checkpoint cleared, starting fresh")
 
-    # Phase A: request analysis in parallel (never sees response)
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        states = list(ex.map(lambda r: phase_a(r, hist), rows))
+    done     = _done_ids() if resume else set()
+    all_rows = df.to_dict("records")
+    todo     = [r for r in all_rows if str(r["transaction_id"]) not in done]
 
-    # Phase B: static tagging + twin matching (sequential, shared state)
-    phase_b(states, static_ids, norm_map)
+    if done:
+        print(f"resuming: {len(done)} rows already done, "
+              f"{len(todo)} remaining")
+    if not todo:
+        print("all rows already in checkpoint")
 
-    # Phase C: evidence + response + behavior calls in parallel
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        states = list(ex.map(phase_c, states))
+    # Batched so a failure costs at most one batch, not the whole run.
+    t0, finished = time.time(), 0
+    for start in range(0, len(todo), BATCH_SIZE):
+        batch = todo[start:start + BATCH_SIZE]
+        try:
+            with ThreadPoolExecutor(MAX_WORKERS) as ex:
+                states = list(ex.map(lambda r: phase_a(r, hist), batch))
+            phase_b(states, static_ids, norm_map)
+            with ThreadPoolExecutor(MAX_WORKERS) as ex:
+                states = list(ex.map(phase_c, states))
+            _append_checkpoint([finish(st) for st in states])
+        except KeyboardInterrupt:
+            print(f"\ninterrupted — {finished} rows saved to checkpoint. "
+                  f"Rerun run_audit() to resume.")
+            break
+        except Exception as e:
+            print(f"\nbatch at row {start} failed: {type(e).__name__}: {e}")
+            print(f"{finished} rows saved. Rerun run_audit() to resume "
+                  f"from here.")
+            break
 
-    result = pd.DataFrame([finish(st) for st in states])
+        finished += len(batch)
+        rate = finished / max(time.time() - t0, 1e-9)
+        left = (len(todo) - finished) / max(rate, 1e-9)
+        print(f"  {finished}/{len(todo)} done "
+              f"({rate * 60:.1f} rows/min, ~{left / 60:.0f} min left)")
+
+    records = _read_checkpoint()
+    if not records:
+        raise RuntimeError("no rows completed — check the errors above")
+    result = pd.DataFrame(records)
     result.to_csv(OUTPUT_CSV, index=False)
+    if len(result) < len(all_rows):
+        print(f"\nNOTE: {len(result)}/{len(all_rows)} rows audited. "
+              f"Rerun run_audit() to finish the rest.")
 
     n    = int(result["needs_review"].sum())
     tiers = result["tier"].value_counts()
