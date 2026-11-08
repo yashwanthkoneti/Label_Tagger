@@ -26,7 +26,7 @@ import json
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -112,11 +112,14 @@ MAX_TOTAL_CHUNK_CHARS = 6000   # shared budget across all chunks per call
 TWIN_SIM_THRESHOLD = 0.6
 
 # Completion tokens per judge call. Raise if you see audit_error on truncated JSON.
+# Sized for ~15-word evidence strings per flag plus JSON overhead.
+# ask() automatically retries at 2x if a reply still comes back truncated,
+# so these are starting points, not hard ceilings.
 MAX_TOKENS = {
-    "request":  800,
-    "evidence": 600,
-    "response": 1500,
-    "behavior": 800,
+    "request":  1200,   # 6 flags + SCOPE_CATEGORY
+    "evidence": 1000,   # 5 flags
+    "response": 2000,   # 10 flags + ROUTE_OBSERVED — the big one
+    "behavior": 1000,   # 5 flags
     "twin":     200,
 }
 
@@ -131,12 +134,17 @@ ROUTE_ERRORS = [
 ]
 QUALITY_STRICT = [
     "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
-    "ANSWERED_WITH_SILENT_ASSUMPTION", "REFUSAL_LEAKS_SUBSTANCE",
-    "REFUSAL_REASON_INACCURATE",
+    "REFUSAL_LEAKS_SUBSTANCE", "REFUSAL_REASON_INACCURATE",
 ]
+# Recorded on the row and visible in soft_flags, but does NOT raise a review.
+# ANSWERED_WITH_SILENT_ASSUMPTION sits here because it is hard for a reviewer
+# to verify quickly: the judge must identify a fact the user never stated,
+# and in practice it fires on conditional answers that were actually correct.
+# Keep it as a signal for analysis; revisit once it has been calibrated.
 QUALITY_SOFT = [
     "ANSWER_HAS_UNSUPPORTED_CLAIM", "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
     "ANSWER_NUMBERS_UNSUPPORTED", "CLARIFICATION_UNNECESSARY",
+    "ANSWERED_WITH_SILENT_ASSUMPTION",
 ]
 LOW_PRIORITY = [
     "RESPONSE_HAS_GREETING_OR_SMALLTALK", "RESPONSE_EXCESSIVE_LENGTH",
@@ -373,6 +381,12 @@ Use ONLY the sections provided. Decide each flag independently.
 Quote the evidence first, then give the decision.
 Decisions: TRUE | FALSE | UNKNOWN.
 UNKNOWN = the evidence needed is absent from the input. NOT for hard cases.
+
+OUTPUT RULES — follow exactly, output is token-limited:
+- Keep each "evidence" under 15 words. A short quote or phrase, not a sentence.
+- No preamble, no markdown fences, no trailing commentary. JSON object only.
+- Include every flag listed below, exactly once.
+
 Return JSON only: {"FLAG_NAME": {"evidence": "...", "decision": "TRUE|FALSE|UNKNOWN"}}"""
 
 SCOPE_TEXT = (
@@ -484,19 +498,38 @@ CALLS = {
                 "TRUE: states a rule, condition, number or date that is not in the chunks.",
                 "FALSE: every factual statement is supported by the chunks."),
             "ANSWER_CONTRADICTS_CHUNKS": (
-                "TRUE: a statement conflicts with what a chunk explicitly says.",
-                "FALSE: no conflict."),
+                "TRUE only for a DIRECT factual contradiction a reader would spot "
+                "immediately: the chunk says X and the answer says not-X, or a different "
+                "number, date, threshold, approver or outcome for the same thing. "
+                "Evidence MUST quote BOTH sides in the form "
+                "'chunk: <quote> || answer: <quote>'. If you cannot quote both, answer FALSE.",
+                "FALSE for everything else. Specifically FALSE when the answer: "
+                "omits something in the chunks; covers only part of the topic; "
+                "paraphrases or summarises; adds caveats; is less detailed than the chunk; "
+                "or mentions the item but with different emphasis. "
+                "Missing information is NOT a contradiction. Incomplete is NOT contradictory. "
+                "When unsure, answer FALSE — chunks are a partial view of the corpus and "
+                "the answer may be drawing on parts not shown."),
             "ANSWER_OMITS_CONDITION_OR_EXCEPTION": (
                 "TRUE: a chunk has an 'unless / only if / except' that changes the answer "
                 "and the response drops it.",
                 "FALSE: all conditions that change the answer are kept."),
             "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY": (
-                "TRUE: tells the user they do or do not qualify, are approved, or are entitled, "
-                "as a personal ruling rather than a general rule.",
-                "FALSE: only the general rule is stated."),
+                "TRUE only if BOTH hold: (a) the answer depends on a fact about THIS user "
+                "(their role, grade, tenure, holdings, status) and (b) the agent decided that "
+                "fact instead of asking. Evidence MUST name the person-specific fact decided. "
+                "Second-person wording alone is NOT enough.",
+                "FALSE whenever the rule is categorical — it turns on the instrument, product "
+                "or transaction type rather than on who is asking. Saying 'you do not need "
+                "pre-clearance' is FALSE if the exemption applies to everyone holding that "
+                "instrument. Restating a rule in second person is not a personal ruling."),
             "ANSWERED_WITH_SILENT_ASSUMPTION": (
-                "TRUE: answers as if it knew something the user never said, without stating the assumption.",
-                "FALSE: no hidden assumption, or it is stated explicitly."),
+                "TRUE: the answer depends on a specific fact about the user that was never "
+                "stated and is not in the chunks (their role, region, grade, holding type, "
+                "employment status). Evidence MUST name the assumed fact in the form "
+                "'assumed: <fact>'. If you cannot name one specific assumed fact, answer FALSE.",
+                "FALSE: the answer holds regardless of unstated details, or the answer "
+                "explicitly states its assumption, or the rule is unconditional."),
             "ACTION_CLAIMED_PERFORMED": (
                 "TRUE: says or implies it did, is doing, or will do something "
                 "(submitted, cancelled, updated, escalated, will follow up).",
@@ -508,6 +541,37 @@ CALLS = {
                 "TRUE: opens or closes with pleasantries or conversational offers to help further.",
                 "FALSE: only substantive content."),
         },
+        "examples": [
+            "Q: 'Do I have to request pre-clearance to invest in a broad-based equity ETF?' "
+            "A: 'No, a broad-based equity ETF is exempt from PAD pre-clearance, so you do "
+            "not need to request pre-clearance for that investment. Two related limits "
+            "still apply: ...' "
+            "-> ANSWER_ASSERTS_PERSONAL_ELIGIBILITY=FALSE. The exemption is a property of "
+            "the INSTRUMENT and applies to everyone; 'you do not need' is the categorical "
+            "rule restated, not a ruling about this person. "
+            "-> ANSWERED_WITH_SILENT_ASSUMPTION=FALSE. The answer states its limits rather "
+            "than hiding them. Quoting a condition the answer already disclosed is not a "
+            "silent assumption.",
+
+            "Q: 'Am I eligible for a sabbatical?' A: 'Yes, you qualify.' "
+            "-> ANSWER_ASSERTS_PERSONAL_ELIGIBILITY=TRUE "
+            "(evidence: 'decided the user's tenure/grade without asking')",
+
+            "Chunk: 'Final Rating must incorporate greenwashing allegations.' "
+            "Answer mentions greenwashing allegations as part of the rating. "
+            "-> ANSWER_CONTRADICTS_CHUNKS=FALSE. The answer AGREES with the chunk. "
+            "Restating or partially covering a requirement is not a contradiction.",
+
+            "Chunk: 'Notice period is 90 days.' Answer: 'Notice period is 30 days.' "
+            "-> ANSWER_CONTRADICTS_CHUNKS=TRUE "
+            "(evidence: 'chunk: 90 days || answer: 30 days')",
+
+            "Chunk lists five approval steps. Answer describes three of them. "
+            "-> ANSWER_CONTRADICTS_CHUNKS=FALSE (incomplete, not contradictory).",
+
+            "Q: 'How many leave days do I get?' A: 'Employees receive 24 days annually.' "
+            "-> both FALSE. Categorical rule, nothing assumed.",
+        ],
     },
     "behavior": {
         "inputs": ["history", "request", "response"],
@@ -809,32 +873,118 @@ def _is_rate_limit(err):
                 "quota", "throttl"))
 
 
-def ask(prompt, call_name="response"):
-    tokens = MAX_TOKENS.get(call_name, 1000)
-    kw     = {INVOKE_TOKEN_KWARG: tokens} if INVOKE_TOKEN_KWARG else {}
-    last   = None
-    rl_tries = 0
+def _repair_truncated_json(text):
+    """Salvage a JSON object whose tail was cut off by the token limit.
 
-    # up to 2 parse attempts; rate-limit errors retry separately with backoff
-    attempt = 0
-    while attempt < 2:
+    A truncated reply looks like:
+        {"FLAG_A": {"evidence": "...", "decision": "TRUE"},
+         "FLAG_B": {"evidence": "some text that stops mid-sen
+    The completed entries are still usable. This closes any dangling string,
+    drops the incomplete trailing entry, and balances the braces.
+    Returns a dict, or None if nothing salvageable.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    s = text[start:]
+
+    # walk the string tracking depth, ignoring braces inside strings
+    depth, in_str, esc, last_complete = 0, False, False, None
+    for i, ch in enumerate(s):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(s[:i + 1])        # complete object
+            if depth == 1:
+                last_complete = i                   # end of a flag entry
+
+    # truncated: keep everything up to the last fully closed flag entry
+    if last_complete is None:
+        return None
+    try:
+        return json.loads(s[:last_complete + 1] + "}")
+    except json.JSONDecodeError:
+        return None
+
+
+def ask(prompt, call_name="response", expected_keys=None):
+    """One judge call.
+
+    Handles three failure modes separately:
+      - rate limits    -> exponential backoff, does not consume an attempt
+      - truncated JSON -> escalate the token budget, then salvage what
+                          completed rather than losing the whole call
+      - malformed JSON -> retry
+
+    expected_keys lets the caller say which flags must be present. A reply
+    that parses but is missing flags is treated as truncated and retried at
+    a larger budget before the partial result is accepted.
+    """
+    base   = MAX_TOKENS.get(call_name, 1000)
+    budgets = [base, base * 2, base * 4]      # escalate on truncation
+    want    = set(expected_keys or [])
+    last, rl_tries, best = None, 0, None
+
+    for i, tokens in enumerate(budgets):
+        is_final = (i == len(budgets) - 1)
         try:
+            kw = {INVOKE_TOKEN_KWARG: tokens} if INVOKE_TOKEN_KWARG else {}
             _throttle()
-            text  = str(llm.invoke(prompt, **kw).content)
+            text = str(llm.invoke(prompt, **kw).content)
+
+            if "{" not in text:
+                raise ValueError(f"no JSON in reply; raw: {text[:300]!r}")
+
+            data  = None
             match = re.search(r"\{.*\}", text, re.S)
-            if not match:
-                raise ValueError(
-                    f"no JSON in reply (attempt {attempt + 1}); "
-                    f"raw: {text[:300]!r}")
-            return json.loads(match.group(0))
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    data = None
+            if data is None:
+                data = _repair_truncated_json(text)
+
+            if data is None:
+                last = ValueError(
+                    f"unparseable JSON at {tokens} tokens; "
+                    f"tail: {text[-200:]!r}")
+                continue
+
+            # keep the most complete result seen so far
+            if best is None or len(data) > len(best):
+                best = data
+
+            missing = want - set(data)
+            if not missing or is_final:
+                return best
+
+            last = ValueError(
+                f"truncated at {tokens} tokens, missing {len(missing)} "
+                f"flag(s); retrying at {budgets[i + 1]}")
+
         except Exception as e:
             last = e
             if _is_rate_limit(e) and rl_tries < RATE_LIMIT_RETRIES:
-                sleep_s = RATE_LIMIT_BACKOFF * (2 ** rl_tries)
+                time.sleep(RATE_LIMIT_BACKOFF * (2 ** rl_tries))
                 rl_tries += 1
-                time.sleep(sleep_s)
-                continue          # does not consume a parse attempt
-            attempt += 1
+                continue
+
+    if best is not None:
+        return best                      # partial is better than nothing
     raise RuntimeError(f"{type(last).__name__}: {last}")
 
 
@@ -846,13 +996,18 @@ def run_call(name, c, errors):
     if name == "response" and not ROUTE_IN_LOG:
         keys.append("ROUTE_OBSERVED")
     try:
-        data = ask(build_prompt(name, c), call_name=name)
+        data = ask(build_prompt(name, c), call_name=name, expected_keys=keys)
     except Exception as e:
         errors.append(f"{name}: {e}")
         return {k: (UNKNOWN, "audit_error") for k in keys}
-    out = {}
+
+    out, missing, bad = {}, [], []
     for k in keys:
-        item = data.get(k) if isinstance(data.get(k), dict) else {}
+        if k not in data:
+            missing.append(k)
+            out[k] = (UNKNOWN, "not_returned")
+            continue
+        item = data[k] if isinstance(data[k], dict) else {}
         d    = str(item.get("decision", "")).strip()
         if k == "SCOPE_CATEGORY":
             d, ok = d.lower(), d.lower() in SCOPE
@@ -862,9 +1017,19 @@ def run_call(name, c, errors):
             d  = d.upper()
             ok = d in VALID
         if not ok:
-            errors.append(f"{name}.{k}: bad decision '{d}'")
+            bad.append(f"{k}='{d}'")
             d = UNKNOWN
         out[k] = (d, str(item.get("evidence", "")))
+
+    # One summarised error per call instead of one per flag, so the errors
+    # column stays readable and a truncated call is obvious at a glance.
+    if missing:
+        errors.append(
+            f"{name}: {len(missing)}/{len(keys)} flags not returned "
+            f"(truncated): {', '.join(missing[:5])}"
+            + ("..." if len(missing) > 5 else ""))
+    if bad:
+        errors.append(f"{name}: invalid values: {', '.join(bad[:5])}")
     return out
 
 
@@ -1254,8 +1419,7 @@ def expected_behavior(route, f, static):
             and f.get("ANSWER_ADDRESSES_QUESTION") == TRUE
             and f.get("ANSWER_CONTRADICTS_CHUNKS") != TRUE
             and f.get("ACTION_CLAIMED_PERFORMED") != TRUE
-            and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE
-            and f.get("ANSWERED_WITH_SILENT_ASSUMPTION") != TRUE):
+            and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE):
         return True, "answered_with_soft_signals_only"
 
     return False, None
@@ -1442,6 +1606,51 @@ def root_cause_for(route, f, themes):
 # --------------------------------------------------------------------------
 # VALIDATOR
 # --------------------------------------------------------------------------
+def enforce_evidence_quality(f, ev):
+    """Demote flags whose evidence does not meet the bar stated in the prompt.
+
+    A flag a reviewer cannot verify is worse than no flag: it costs review
+    time and erodes trust in the queue. If the judge could not name the
+    assumed fact or quote the ruling, the finding is not actionable.
+    """
+    notes = []
+
+    # silent assumption must name the assumed fact
+    if f.get("ANSWERED_WITH_SILENT_ASSUMPTION") == TRUE:
+        e = str(ev.get("ANSWERED_WITH_SILENT_ASSUMPTION", "")).lower()
+        if "assumed" not in e or len(e) < 12:
+            f["ANSWERED_WITH_SILENT_ASSUMPTION"] = FALSE   # not UNKNOWN:
+            # an unverifiable finding is treated as no finding, so it does
+            # not re-enter the queue as a 'critical UNKNOWN'
+            notes.append("silent_assumption demoted: judge named no "
+                         "specific assumed fact")
+
+    # personal eligibility must name a person-specific fact the agent decided
+    if f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") == TRUE:
+        e = str(ev.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY", "")).lower()
+        person_fact = re.search(
+            r"\brole\b|\bgrade\b|\btenure\b|\bstatus\b|\bholding\b|"
+            r"\beligib|\bqualif|\bapprov|\bentitl|\bexempt\b", e)
+        if not person_fact or len(e) < 12:
+            f["ANSWER_ASSERTS_PERSONAL_ELIGIBILITY"] = FALSE
+            notes.append("personal_eligibility demoted: evidence names no "
+                         "person-specific fact the agent decided")
+
+    # contradiction must quote BOTH the chunk and the answer. Without both
+    # sides a reviewer cannot confirm it, and in practice these turn out to
+    # be omissions or partial coverage rather than real conflicts.
+    if f.get("ANSWER_CONTRADICTS_CHUNKS") == TRUE:
+        e = str(ev.get("ANSWER_CONTRADICTS_CHUNKS", ""))
+        has_both = ("||" in e) or (
+            re.search(r"\bchunk\b", e, re.I) and
+            re.search(r"\banswer\b|\bresponse\b", e, re.I))
+        if not has_both or len(e) < 20:
+            f["ANSWER_CONTRADICTS_CHUNKS"] = FALSE
+            notes.append("contradiction demoted: evidence does not quote "
+                         "both the chunk and the answer")
+    return notes
+
+
 def validate(f):
     issues = []
     if (f.get("RETRIEVAL_RETURNED_CHUNKS") == FALSE
@@ -1478,10 +1687,9 @@ def verdict(f, issues, errors, themes, is_expected=False):
     audit_e  = [f"AUDIT_ERROR: {x}" for x in errors]
     val_e    = [f"VALIDATION: {x}" for x in issues]
 
-    # critical UNKNOWN on a complete trace also triggers review
-    if f.get("AUDIT_TRACE_INCOMPLETE") == FALSE:
-        critical += [f"{x}:UNKNOWN" for x in CRITICAL
-                     if f.get(x) == UNKNOWN]
+    # UNKNOWN does NOT raise a review. An UNKNOWN carries no rationale a
+    # reviewer could act on, so it is a non-finding rather than a weak
+    # finding. Tracked in the output columns for calibration instead.
 
     # Expected behavior: only genuine safety issues and audit failures raise.
     # Route errors and quality flags are suppressed because the agent did
@@ -1535,6 +1743,10 @@ def in_sample_queue(transaction_id, tier, rate=None):
 def finish(st):
     route = st["route"]
     f     = st["flags"]
+    # Demote flags whose evidence is too weak to verify, BEFORE anything
+    # downstream reads them.
+    demoted = enforce_evidence_quality(f, st["ev"])
+
     f.update(derive(route, f))
 
     # Expected-behavior check runs FIRST. If the agent did the right thing,
@@ -1588,7 +1800,17 @@ def finish(st):
                                and in_sample_queue(row["transaction_id"],
                                                    v["tier"])),
         "tier":               v["tier"],
-        "validation_notes":   v["validation_notes"],
+        "reasons":            "; ".join(v["reasons"]),
+        # each raised flag paired with the judge's own evidence, so a
+        # reviewer can confirm or overturn it without opening evidence_json
+        "why_flagged":        " | ".join(
+                                  f"{x}: {st['ev'].get(x, '(no evidence)')}"
+                                  for x in v["reasons"]
+                                  if not x.startswith(("AUDIT_ERROR",
+                                                       "VALIDATION"))),
+        "validation_notes":   "; ".join(
+                                  filter(None, [v["validation_notes"],
+                                                "; ".join(demoted)])),
         "soft_flags":         "; ".join(v["soft_flags"]),
         "message":            v["message"],
         "errors":             "; ".join(st["errors"]),
@@ -1660,6 +1882,24 @@ def run_audit(path):
           f"classified as expected behavior")
     if len(exp):
         print(exp["expected_reason"].value_counts().to_string())
+
+    # what is actually driving the review queue
+    rc = Counter()
+    for r in result.loc[result["needs_review"], "reasons"]:
+        for part in str(r).split("; "):
+            if part:
+                rc[part.split(":")[0].strip()] += 1
+    if rc:
+        print("\nraising review (flag -> count):")
+        for k, cnt in rc.most_common():
+            print(f"  {k}: {cnt}")
+
+    # scope vs route: a large in_scope -> refused_scope block is the
+    # signature of a genuine over-blocking problem, not a tuning issue
+    if "scope_category" in result and "route" in result:
+        print("\nscope x route:")
+        print(pd.crosstab(result["scope_category"],
+                          result["route"]).to_string())
     print(f"\nOutput: {OUTPUT_CSV}")
     return result
 
