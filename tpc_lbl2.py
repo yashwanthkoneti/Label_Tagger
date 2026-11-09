@@ -13,13 +13,9 @@ Install:
   pip install pymupdf sentence-transformers umap-learn hdbscan scikit-learn numpy
 
 Usage:
-  python policy_topics.py extract --pdfs ./policies --out ./run
-  python policy_topics.py embed   --out ./run
-  python policy_topics.py cluster --out ./run --min-cluster-size 5
-  python policy_topics.py label   --out ./run            # writes prompts; plug in call_llm()
-  python policy_topics.py verify  --out ./run
+  Edit the CONFIG block below (paths + settings), choose STAGES, then run:
+  python policy_topics.py
 """
-import argparse
 import csv
 import json
 import re
@@ -27,6 +23,39 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
+from types import SimpleNamespace
+
+# ============================================================================ CONFIG
+CONFIG = SimpleNamespace(
+    pdfs=r"C:/path/to/policy_pdfs",   # folder with PDFs (searched recursively)
+    out=r"C:/path/to/output",         # all intermediate + result files go here
+
+    # embed
+    df_ratio=0.15,       # share of docs a sentence must appear in to count as boilerplate
+    drop_pattern=[],     # extra regexes for org-specific boilerplate, e.g. [r"Acme (Ltd|Group)"]
+    remove_pcs=0,        # top principal components to remove after centering (0 = off)
+
+    # cluster
+    min_cluster_size=5,
+    min_samples=None,
+
+    # label
+    dry_run=True,        # True = only write prompts.jsonl; False = call call_llm()
+    min_prob=0.3,        # cluster members below this membership prob get a per-doc prompt
+    k=5,                 # similar labelled docs shown in per-doc prompts
+
+    # verify
+    merge_threshold=0.25,  # cosine distance under which topic labels are merge candidates
+)
+
+# Stages to run, in order. Comment out the ones you don't need on a given run.
+STAGES = [
+    "extract",
+    "embed",
+    "cluster",
+    "label",
+    # "verify",   # needs topics.json, i.e. label with dry_run=False
+]
 
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # free, CPU-friendly, 512-token window
 
@@ -412,25 +441,13 @@ def cmd_verify(a):
     print(f"wrote {out/'label_check.csv'} and {out/'merge_candidates.txt'}")
 
 
-# ----------------------------------------------------------------------------- cli
+# ----------------------------------------------------------------------------- run
 def main():
-    ap = argparse.ArgumentParser()
-    sp = ap.add_subparsers(dest="cmd", required=True)
-    p = sp.add_parser("extract"); p.add_argument("--pdfs", required=True); p.add_argument("--out", required=True)
-    p = sp.add_parser("embed"); p.add_argument("--out", required=True)
-    p.add_argument("--remove-pcs", type=int, default=0)
-    p.add_argument("--df-ratio", type=float, default=0.15, help="share of docs a sentence must appear in to count as boilerplate")
-    p.add_argument("--drop-pattern", action="append", help="regex for org-specific boilerplate (repeatable)")
-    p = sp.add_parser("cluster"); p.add_argument("--out", required=True)
-    p.add_argument("--min-cluster-size", type=int, default=5); p.add_argument("--min-samples", type=int, default=None)
-    p = sp.add_parser("label"); p.add_argument("--out", required=True)
-    p.add_argument("--dry-run", action="store_true", help="only write prompts")
-    p.add_argument("--min-prob", type=float, default=0.3); p.add_argument("--k", type=int, default=5)
-    p = sp.add_parser("verify"); p.add_argument("--out", required=True)
-    p.add_argument("--merge-threshold", type=float, default=0.25)
-    a = ap.parse_args()
-    {"extract": cmd_extract, "embed": cmd_embed, "cluster": cmd_cluster,
-     "label": cmd_label, "verify": cmd_verify}[a.cmd](a)
+    stages = {"extract": cmd_extract, "embed": cmd_embed, "cluster": cmd_cluster,
+              "label": cmd_label, "verify": cmd_verify}
+    for name in STAGES:
+        print(f"=== {name}")
+        stages[name](CONFIG)
 
 
 if __name__ == "__main__":
