@@ -125,7 +125,7 @@ TWIN_SIM_THRESHOLD = 0.6
 MAX_TOKENS = {
     "request":  1200,   # 6 flags + SCOPE_CATEGORY
     "evidence": 1000,   # 5 flags
-    "response": 2000,   # 10 flags + ROUTE_OBSERVED — the big one
+    "response": 2200,   # 10 flags + ROUTE_OBSERVED — the big one
     "behavior": 1000,   # 5 flags
     "twin":     200,
 }
@@ -140,7 +140,8 @@ ROUTE_ERRORS = [
     "ACTION_GUARDRAIL_FALSE_BLOCK", "GUARDRAIL_FALSE_PASS",
 ]
 QUALITY_STRICT = [
-    "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
+    "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_MISREADS_TABLE",
+    "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
     "REFUSAL_LEAKS_SUBSTANCE", "REFUSAL_REASON_INACCURATE",
 ]
 # Recorded on the row and visible in soft_flags, but does NOT raise a review.
@@ -183,6 +184,7 @@ INSCOPE = {"in_scope_rule", "in_scope_user_specific"} | (
 
 ANSWER_ONLY = [
     "ANSWER_ADDRESSES_QUESTION", "ANSWER_HAS_UNSUPPORTED_CLAIM",
+    "ANSWER_MISREADS_TABLE",
     "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
     "ANSWERED_WITH_SILENT_ASSUMPTION", "ANSWER_NUMBERS_UNSUPPORTED",
     "ANSWER_ACKNOWLEDGES_LIMITATION",
@@ -519,12 +521,25 @@ CALLS = {
             "ANSWER_HAS_UNSUPPORTED_CLAIM": (
                 "TRUE: states a rule, condition, number or date that is not in the chunks.",
                 "FALSE: every factual statement is supported by the chunks."),
+            "ANSWER_MISREADS_TABLE": (
+                "TRUE: a chunk contains a table (pipe-delimited rows) and the answer "
+                "pairs a value with the wrong row — wrong country, role, tier or "
+                "category. Evidence MUST quote the table row and the answer's claim as "
+                "'row: <row> || answer: <claim>'. Check each value against its OWN row.",
+                "FALSE: no table in the chunks, or every value the answer cites sits in "
+                "the row it is attributed to. Also FALSE if the answer simply omits rows."),
             "ANSWER_CONTRADICTS_CHUNKS": (
                 "TRUE only for a DIRECT factual contradiction a reader would spot "
                 "immediately: the chunk says X and the answer says not-X, or a different "
                 "number, date, threshold, approver or outcome for the same thing. "
                 "Evidence MUST quote BOTH sides in the form "
                 "'chunk: <quote> || answer: <quote>'. If you cannot quote both, answer FALSE.",
+                "READ THE WHOLE ANSWER FIRST. If the answer states the chunk's position "
+                "ANYWHERE — in a later clause, a caveat, an exception, a 'however', a "
+                "bullet further down — there is NO contradiction, and the decision is "
+                "FALSE. Never judge a contradiction from one fragment of the answer: an "
+                "answer that says 'X applies, though Y remains the case for Z' agrees "
+                "with a chunk stating Y. "
                 "FALSE for everything else. Specifically FALSE when the answer: "
                 "omits something in the chunks; covers only part of the topic; "
                 "paraphrases or summarises; adds caveats; is less detailed than the chunk; "
@@ -587,6 +602,14 @@ CALLS = {
             "Chunk: 'Notice period is 90 days.' Answer: 'Notice period is 30 days.' "
             "-> ANSWER_CONTRADICTS_CHUNKS=TRUE "
             "(evidence: 'chunk: 90 days || answer: 30 days')",
+
+            "Chunk: 'Interconnected policies are not published on GovPoint and remain "
+            "accessible via ePolicy.' Answer: 'Policies are available on GovPoint, but "
+            "some interconnected policies and standards may still remain on ePolicy "
+            "until migration to GovPoint.' "
+            "-> ANSWER_CONTRADICTS_CHUNKS=FALSE. The answer's second clause states "
+            "exactly what the chunk says. Quoting only its first clause would "
+            "manufacture a contradiction that is not there.",
 
             "Chunk lists five approval steps. Answer describes three of them. "
             "-> ANSWER_CONTRADICTS_CHUNKS=FALSE (incomplete, not contradictory).",
@@ -710,7 +733,16 @@ def _parse_chunk_item(item):
     fields: dict = {}
     misc_lines: list = []
 
+    # A pipe-delimited table row contains colons only by accident, but it must
+    # never be split on one: "| Limit: | 500 |" is a table row, not a field.
+    # Row structure also has to survive, or the judge cannot tell which value
+    # belongs to which row and cannot verify a table-based answer.
+    is_table_row = lambda s: s.strip().startswith("|") or s.count("|") >= 2
+
     for line in lines:
+        if is_table_row(line):
+            misc_lines.append(line.rstrip())      # keep verbatim, keep the row
+            continue
         m = kv_re.match(line)
         if m:
             key   = re.sub(r"\s+", "_", m.group(1).strip().lower())
@@ -736,7 +768,8 @@ def _parse_chunk_item(item):
                       "geo_scope", "geo")
     # everything else that had a colon goes to extras
     extras     = {k: v for k, v in fields.items() if v}
-    misc_text  = " | ".join(misc_lines)
+    # newline, not " | ": joining with a pipe destroys markdown tables
+    misc_text  = "\n".join(misc_lines)
 
     # build the text the judge reads: structured fields first, then misc
     text_parts = []
@@ -1076,7 +1109,10 @@ def ctx_of(row, hist):
 # --------------------------------------------------------------------------
 def code_flags(row, c):
     resp = row["response"]
+    has_table = any("|" in ch.get("text", "") and
+                    ch.get("text", "").count("|") >= 4 for ch in c["chunks"])
     return {
+        "_HAS_TABLE":                b(has_table),
         "AUDIT_TRACE_INCOMPLETE":    b(not row["request"] or not resp),
         "RETRIEVAL_RETURNED_CHUNKS": b(bool(c["chunks"])),
         "RESPONSE_EXCESSIVE_LENGTH": b(len(resp) > 1200),
@@ -1437,6 +1473,7 @@ def expected_behavior(route, f, static):
             and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE
             and f.get("ACTION_CLAIMED_PERFORMED") != TRUE
             and f.get("ANSWER_COVERS_ALL_PARTS") != FALSE
+            and f.get("ANSWER_MISREADS_TABLE") != TRUE
             and f.get("AUDIT_INPUT_LIMITED") != TRUE):
         return True, "answered_correctly"
 
@@ -1464,7 +1501,8 @@ def expected_behavior(route, f, static):
             and f.get("ANSWER_ADDRESSES_QUESTION") == TRUE
             and f.get("ANSWER_CONTRADICTS_CHUNKS") != TRUE
             and f.get("ACTION_CLAIMED_PERFORMED") != TRUE
-            and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE):
+            and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE
+            and f.get("ANSWER_MISREADS_TABLE") != TRUE):
         return True, "answered_with_soft_signals_only"
 
     return False, None
@@ -1606,9 +1644,21 @@ def root_cause_for(route, f, themes):
             and route in ("clarified",) + REFUSED):
         return {"stage": "context_use", "cause": "context_continuity_failure"}
 
-    # 3. retrieval (applicability first, then coverage)
+    # 3. retrieval
+    # An unnecessary clarification fires because one of the three sources was
+    # CLEAR. A retrieval weakness therefore cannot be what made it
+    # unnecessary, so retrieval does not get to claim this theme — doing so
+    # produced causes like "retrieval_partial_coverage" on rows where the
+    # agent simply asked a question it did not need to ask.
+    clarification_only = (
+        "unnecessary_clarification" in themes
+        and not any(t in themes for t in
+                    ("partial_answer", "intent_misinterpretation",
+                     "excessive_guardrail")))
+
     retrieval_bad = (
-        f.get("RETRIEVAL_RETURNED_CHUNKS") == TRUE
+        not clarification_only
+        and f.get("RETRIEVAL_RETURNED_CHUNKS") == TRUE
         and (f.get("AUDIT_INPUT_LIMITED") == TRUE
              or f.get("CHUNKS_ON_TOPIC") == FALSE
              or f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE))
@@ -1633,9 +1683,21 @@ def root_cause_for(route, f, themes):
         return {"stage": "retrieval",
                 "cause": "acknowledged_limitation_correctly"}
 
-    # 4. decision
-    if ("excessive_guardrail" in themes
-            or "unnecessary_clarification" in themes):
+    # 4. decision — clarification first, so its own causes are reachable.
+    # These must come BEFORE the guardrail block: that block also matched
+    # unnecessary_clarification and returned guardrail-flavoured causes,
+    # which made every cause below it dead code.
+    if "unnecessary_clarification" in themes:
+        if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
+            return {"stage": "decision",
+                    "cause": "clarified_though_chunks_resolved_it"}
+        if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
+            return {"stage": "request_understanding",
+                    "cause": "clarified_on_stale_context"}
+        return {"stage": "decision",
+                "cause": "clarified_though_request_was_clear"}
+
+    if "excessive_guardrail" in themes:
         if f.get("CORPUS_HAS_ANSWER") == TRUE:
             return {"stage": "decision",
                     "cause": "guardrail_blocked_answerable"}
@@ -1649,16 +1711,6 @@ def root_cause_for(route, f, themes):
             return {"stage": "decision",
                     "cause": "refused_answerable_generally"}
         return {"stage": "decision", "cause": "prompt_or_routing"}
-
-    if "unnecessary_clarification" in themes:
-        if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
-            return {"stage": "decision",
-                    "cause": "clarified_though_chunks_resolved_it"}
-        if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
-            return {"stage": "request_understanding",
-                    "cause": "clarified_on_stale_context"}
-        return {"stage": "decision",
-                "cause": "clarified_though_request_was_clear"}
 
     if "incomplete_next_step_guidance" in themes:
         return {"stage": "decision", "cause": "no_next_step_in_template"}
@@ -1678,7 +1730,15 @@ def root_cause_for(route, f, themes):
 # --------------------------------------------------------------------------
 # VALIDATOR
 # --------------------------------------------------------------------------
-def enforce_evidence_quality(f, ev):
+_STOPWORDS = {
+    "there", "their", "which", "where", "these", "those", "about", "other",
+    "would", "could", "should", "being", "having", "shall", "while", "until",
+    "still", "remain", "remains", "available", "accessible", "documents",
+    "document", "policy", "policies", "procedure", "procedures",
+}
+
+
+def enforce_evidence_quality(f, ev, response_text=""):
     """Demote flags whose evidence does not meet the bar stated in the prompt.
 
     A flag a reviewer cannot verify is worse than no flag: it costs review
@@ -1708,6 +1768,14 @@ def enforce_evidence_quality(f, ev):
             notes.append("personal_eligibility demoted: evidence names no "
                          "person-specific fact the agent decided")
 
+    # table misread must quote the row and the claim
+    if f.get("ANSWER_MISREADS_TABLE") == TRUE:
+        e = str(ev.get("ANSWER_MISREADS_TABLE", ""))
+        if "||" not in e or len(e) < 20:
+            f["ANSWER_MISREADS_TABLE"] = FALSE
+            notes.append("table_misread demoted: evidence does not quote "
+                         "the table row and the answer's claim")
+
     # contradiction must quote BOTH the chunk and the answer. Without both
     # sides a reviewer cannot confirm it, and in practice these turn out to
     # be omissions or partial coverage rather than real conflicts.
@@ -1720,6 +1788,80 @@ def enforce_evidence_quality(f, ev):
             f["ANSWER_CONTRADICTS_CHUNKS"] = FALSE
             notes.append("contradiction demoted: evidence does not quote "
                          "both the chunk and the answer")
+        elif response_text and "||" in e:
+            # The judge may have quoted only a fragment of the answer. If the
+            # chunk's own distinctive words appear SOMEWHERE in the full
+            # response, the answer states the chunk's position and there is
+            # no contradiction — the fragment just hid the later clause.
+            chunk_side = e.split("||")[0]
+            chunk_side = re.sub(r"^\s*chunk\s*:\s*", "", chunk_side,
+                                flags=re.I)
+            resp_low = response_text.lower()
+            terms = [w for w in re.findall(r"[A-Za-z][\w'-]{4,}", chunk_side)
+                     if w.lower() not in _STOPWORDS]
+            if terms:
+                hits = sum(1 for w in terms if w.lower() in resp_low)
+                if hits / len(terms) >= 0.6:
+                    f["ANSWER_CONTRADICTS_CHUNKS"] = FALSE
+                    notes.append(
+                        f"contradiction demoted: the response already states "
+                        f"the chunk's position ({hits}/{len(terms)} of its key "
+                        f"terms appear in the answer) — likely quoted from a "
+                        f"fragment rather than the whole answer")
+    return notes
+
+
+def resolve_conflicts(f):
+    """Drop flags that cannot logically be TRUE given the other flags.
+
+    Without this, a judge mistake can raise a review on an impossible basis
+    — e.g. 'the answer contradicts the chunks' on a row where no chunks were
+    retrieved. A reviewer opening that row finds nothing to check and loses
+    confidence in the whole queue.
+    """
+    notes = []
+    no_chunks = f.get("RETRIEVAL_RETURNED_CHUNKS") == FALSE
+
+    # 1. Cannot contradict, misread or be unsupported by chunks that do not exist.
+    if no_chunks:
+        for flag, label in (
+                ("ANSWER_CONTRADICTS_CHUNKS", "contradiction"),
+                ("ANSWER_MISREADS_TABLE", "table misread"),
+                ("ANSWER_HAS_UNSUPPORTED_CLAIM", "unsupported claim"),
+                ("ANSWER_OMITS_CONDITION_OR_EXCEPTION", "omitted condition"),
+                ("CHUNKS_ON_TOPIC", "chunks on topic")):
+            if f.get(flag) == TRUE:
+                f[flag] = FALSE
+                notes.append(f"{label} dropped: no chunks were retrieved")
+
+    # 2. A table misread requires a table. If the chunks hold no pipe rows the
+    #    judge has invented one.
+    if f.get("ANSWER_MISREADS_TABLE") == TRUE and f.get("_HAS_TABLE") == FALSE:
+        f["ANSWER_MISREADS_TABLE"] = FALSE
+        notes.append("table misread dropped: no table in the retrieved chunks")
+
+    # 3. The route-level flags already name the specific defect. Keeping the
+    #    generic ROUTE_MISMATCH alongside them counts one problem twice.
+    if f.get("ROUTE_MISMATCH") == TRUE and any(
+            f.get(x) == TRUE for x in ("GUARDRAIL_FALSE_BLOCK",
+                                       "ACTION_GUARDRAIL_FALSE_BLOCK",
+                                       "GUARDRAIL_FALSE_PASS")):
+        f["ROUTE_MISMATCH"] = FALSE
+        notes.append("ROUTE_MISMATCH folded into the specific guardrail flag")
+
+    # 4. Blocked and not-blocked cannot both be wrong on the same row.
+    if (f.get("GUARDRAIL_FALSE_BLOCK") == TRUE
+            and f.get("GUARDRAIL_FALSE_PASS") == TRUE):
+        f["GUARDRAIL_FALSE_PASS"] = UNKNOWN
+        notes.append("FALSE_BLOCK and FALSE_PASS both TRUE — contradictory, "
+                     "FALSE_PASS cleared")
+
+    # 5. An answer that openly flags the corpus gap is not also silently
+    #    contradicting the corpus.
+    if (f.get("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE
+            and f.get("ANSWER_CONTRADICTS_CHUNKS") == TRUE):
+        notes.append("NOTE: answer acknowledges a limitation AND is judged to "
+                     "contradict the chunks — verify this one by hand")
     return notes
 
 
@@ -1817,9 +1959,13 @@ def finish(st):
     f     = st["flags"]
     # Demote flags whose evidence is too weak to verify, BEFORE anything
     # downstream reads them.
-    demoted = enforce_evidence_quality(f, st["ev"])
+    demoted = enforce_evidence_quality(f, st["ev"],
+                                       st["row"].get("response", ""))
 
     f.update(derive(route, f))
+
+    # Drop impossible flag combinations before anything reads them.
+    conflicts = resolve_conflicts(f)
 
     # Expected-behavior check runs FIRST. If the agent did the right thing,
     # no theme is assigned and the row stays out of the review queue.
@@ -1887,7 +2033,8 @@ def finish(st):
                                                        "VALIDATION"))),
         "validation_notes":   "; ".join(
                                   filter(None, [v["validation_notes"],
-                                                "; ".join(demoted)])),
+                                                "; ".join(demoted),
+                                                "; ".join(conflicts)])),
         "soft_flags":         "; ".join(v["soft_flags"]),
         "message":            v["message"],
         "errors":             "; ".join(st["errors"]),
