@@ -1499,12 +1499,17 @@ def expected_behavior(route, f, static):
 
     # 11. Answered with only soft quality signals (unsupported-claim style
     #     flags that are known to over-fire). Not a confirmed failure.
+    #     Must exclude the partial-coverage case: an answer that covers one
+    #     of two requested standards is a real defect (partial_answer), and
+    #     clearing it here short-circuits themes_for before it can fire.
     if (route == "answered"
             and f.get("ANSWER_ADDRESSES_QUESTION") == TRUE
             and f.get("ANSWER_CONTRADICTS_CHUNKS") != TRUE
             and f.get("ACTION_CLAIMED_PERFORMED") != TRUE
             and f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") != TRUE
-            and f.get("ANSWER_MISREADS_TABLE") != TRUE):
+            and f.get("ANSWER_MISREADS_TABLE") != TRUE
+            and f.get("ANSWER_COVERS_ALL_PARTS") != FALSE
+            and f.get("CHUNKS_PARTIAL_COVERAGE") != TRUE):
         return True, "answered_with_soft_signals_only"
 
     return False, None
@@ -2592,9 +2597,33 @@ def factors_for(r):
 
 
 def add_quality_factors(df):
-    """Add quality_factors / _strong / factor_count / factor_evidence."""
+    """Add quality_factors / _strong / factor_count / factor_evidence.
+
+    A factor is only populated when the row carries a THEME. A row the audit
+    cleared as expected behaviour cannot simultaneously be reported as an
+    experience the user would call defective — that would contradict the
+    verdict. Anything that would have fired on a cleared row is kept in
+    suppressed_factors so the signal is visible for drift monitoring
+    without entering the counts.
+    """
     rows = df.to_dict("records")
-    allf = [factors_for(r) for r in rows]
+    raw  = [factors_for(r) for r in rows]
+
+    def defective(r):
+        """Did the audit decide something was wrong on this row?
+
+        Gate on expected_behavior, NOT on themes. Some of the most serious
+        defects — a contradiction of the source, a misread table — have no
+        theme name in themes_for, so gating on themes would silence exactly
+        the findings that matter most. expected_behavior is the verdict that
+        actually says "the agent did the right thing".
+        """
+        if "expected_behavior" in r:
+            return not bool(r.get("expected_behavior"))
+        return str(r.get("themes") or "").strip() != ""   # fallback
+
+    allf = [fs if defective(r) else [] for r, fs in zip(rows, raw)]
+    supp = [[] if defective(r) else fs for r, fs in zip(rows, raw)]
 
     df = df.copy()
     df["quality_factors"] = ["; ".join(fa for fa, _, _ in fs) for fs in allf]
@@ -2607,6 +2636,13 @@ def add_quality_factors(df):
     df["primary_factor"] = [
         next((fa for fa, st, _ in fs if st == "strong"), None)
         or (fs[0][0] if fs else None) for fs in allf]
+    # would have fired, but the row was cleared — monitoring only
+    df["suppressed_factors"] = ["; ".join(fa for fa, _, _ in fs) for fs in supp]
+
+    # one boolean column per factor, for filtering and pivoting
+    for fa in FACTORS:
+        df[f"factor_{fa}"] = [
+            any(x == fa for x, _, _ in fs) for fs in allf]
     return df
 
 
@@ -2615,6 +2651,8 @@ def factor_report(df):
     rows = df.to_dict("records")
     counts, strong = {fa: 0 for fa in FACTORS}, {fa: 0 for fa in FACTORS}
     for r in rows:
+        if r.get("expected_behavior") is True:
+            continue          # cleared rows carry no factor
         for fa, st, _ in factors_for(r):
             counts[fa] += 1
             if st == "strong":
@@ -2638,6 +2676,8 @@ def factor_by_cause(df, cause_col="all_causes"):
     col = cause_col if cause_col in df.columns else "cause"
     pairs = []
     for r in df.to_dict("records"):
+        if r.get("expected_behavior") is True:
+            continue          # cleared rows carry no factor
         causes = [c.strip() for c in str(r.get(col) or "").split(";")
                   if c.strip()]
         for fa, _, _ in factors_for(r):
