@@ -35,9 +35,16 @@ Type tolerance, because a DataFrame is messier than a CSV:
 `document_chunks` as text is parsed in this order:
     1. already a list/dict        -> used as-is
     2. JSON or a Python repr      -> parsed
-    3. labelled text             -> split on each `**File Name:**` marker,
-                                     taking doc_id from the filename and
-                                     document_title into metadata
+    3. labelled text             -> every `**Key:** value` field is discovered
+                                     and becomes chunk metadata; whichever key
+                                     repeats per document is used as the block
+                                     boundary. Keys are normalised, so
+                                     `**__File Name__:**`, `**File Name:**` and
+                                     `**File Name**:` are all the same key.
+                                     The summary's `discovered_key` rows list
+                                     every key found with its distinct values -
+                                     read those to see which attributes your
+                                     corpus branches on.
     4. last resort               -> split on a blank-line run or a rule.
                                      NOTE '|||' is deliberately not a
                                      separator: pipe tables would be shredded.
@@ -108,8 +115,28 @@ _DISTANCE_KEYS = ("distance", "_distance", "l2", "cosine_distance")
 _DOCID_KEYS = ("doc_id", "document_id", "source", "id", "file_name", "filename", "title", "uri")
 _META_KEYS = ("metadata", "meta", "attributes", "tags")
 
-_FILE_NAME = re.compile(r"\*\*\s*File\s*Name\s*:?\s*\*\*[ \t]*(.*)", re.IGNORECASE)
-_DOC_TITLE = re.compile(r"\*\*\s*Document\s*Title\s*:?\s*\*\*[ \t]*(.*)", re.IGNORECASE)
+# A labelled field: **Key:** value   /   **Key**: value   /   **__KEY__:** value
+# The key is captured loosely and normalised afterwards, so decoration
+# (underscores, spacing, an inside-or-outside colon) does not matter.
+_LABEL = re.compile(r"\*\*\s*([^*\n]+?)\s*\*\*[ \t]*:?[ \t]*(.*)")
+
+# Keys whose repetition marks the start of a new document block. The first one
+# present is used; if none match, the parser infers the boundary from whichever
+# key repeats most (see _infer_boundary_key), so an unknown schema still works.
+CHUNK_BOUNDARY_KEYS = ("file_name", "filename", "file", "document_name",
+                       "doc_name", "source", "source_file", "document")
+
+# Keys that carry a document identity rather than an attribute to branch on.
+DOC_ID_KEYS = ("file_name", "filename", "file", "document_name", "doc_name",
+               "source", "source_file", "document", "document_title", "title")
+
+
+def _norm_key(raw: str) -> str:
+    """'**__File Name__:**' -> 'file_name'."""
+    k = raw.strip().strip(":").strip()
+    k = k.strip("_").strip()
+    k = re.sub(r"\s+", "_", k.lower())
+    return re.sub(r"[^a-z0-9_]+", "", k)
 
 _DATE_FORMATS = (
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
@@ -133,6 +160,9 @@ class ParseStats:
         self.labelled_text_rows = 0
         self.native_object_rows = 0
         self.chunk_parse_failures = 0
+        self.keys_seen: Dict[str, int] = {}      # every labelled key discovered
+        self.boundary_key: Optional[str] = None
+        self.key_values: Dict[str, set] = {}     # distinct values per key
 
 
 # ---------------------------------------------------------------------------
@@ -250,26 +280,103 @@ def _chunks_from_objects(items: Sequence[Any], stats: ParseStats) -> List[Chunk]
     return chunks
 
 
+def _infer_boundary_key(fields: Sequence[Tuple[str, int]]) -> Optional[str]:
+    """Pick the key that delimits document blocks.
+
+    Prefers a configured filename-ish key. Otherwise takes the key that occurs
+    most often and more than once - structurally, the field repeated per
+    document is the one that starts each document. Purely positional: no
+    assumption about what any key means.
+    """
+    names = [k for k, _pos in fields]
+    for cand in CHUNK_BOUNDARY_KEYS:
+        if cand in names:
+            return cand
+    counts: Dict[str, int] = {}
+    for k in names:
+        counts[k] = counts.get(k, 0) + 1
+    best = max(counts.items(), key=lambda kv: kv[1]) if counts else None
+    if best and best[1] > 1:
+        return best[0]
+    # Single occurrence of everything: one document, delimited by its first key.
+    return names[0] if names else None
+
+
 def _chunks_from_labelled_text(raw: str, stats: ParseStats) -> Optional[List[Chunk]]:
-    """The `**File Name:** / **Document Title:**` form."""
-    marks = list(_FILE_NAME.finditer(raw))
-    if not marks:
+    """Parse the `**Key:** value` form, discovering keys rather than assuming them.
+
+    Every labelled field becomes chunk metadata, which is what makes
+    BRANCH_UNRESOLVED, STALE_SOURCE and SENSITIVE computable. Whichever key
+    repeats per document is used as the block boundary.
+    """
+    matches = list(_LABEL.finditer(raw))
+    if not matches:
         return None
+
+    fields = [(_norm_key(m.group(1)), m.start()) for m in matches]
+    fields = [(k, p) for k, p in fields if k]
+    if not fields:
+        return None
+    for k, _p in fields:
+        stats.keys_seen[k] = stats.keys_seen.get(k, 0) + 1
+
+    boundary = _infer_boundary_key(fields)
+    stats.boundary_key = boundary
+    starts = [p for k, p in fields if k == boundary] or [fields[0][1]]
+    if starts[0] > 0:
+        # Text before the first label belongs to no document; keep it as a
+        # preamble on the first chunk rather than discarding it.
+        pass
+
     out: List[Chunk] = []
-    for i, m in enumerate(marks):
-        end = marks[i + 1].start() if i + 1 < len(marks) else len(raw)
-        block = raw[m.start():end]
-        fname = (m.group(1) or "").strip()
-        tm = _DOC_TITLE.search(block)
-        title = (tm.group(1) or "").strip() if tm else ""
-        body = _DOC_TITLE.sub("", _FILE_NAME.sub("", block)).strip()
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(raw)
+        block = raw[start:end]
+
         meta: Dict[str, str] = {}
-        if fname:
-            meta["file_name"] = fname
-        if title:
-            meta["document_title"] = title
-        out.append(Chunk(text=body, score=0.0,
-                         doc_id=fname or title or f"chunk_{i}", metadata=meta))
+        body_parts: List[str] = []
+        pos = 0
+        for m in _LABEL.finditer(block):
+            # Text between the previous field and this one is body content.
+            if m.start() > pos:
+                seg = block[pos:m.start()].strip()
+                if seg:
+                    body_parts.append(seg)
+            key = _norm_key(m.group(1))
+            val = (m.group(2) or "").strip()
+            if key and val:
+                meta[key] = val
+            elif key:
+                meta.setdefault(key, "")
+            pos = m.end()
+        tail = block[pos:].strip()
+        if tail:
+            body_parts.append(tail)
+
+        # A label with no inline value takes the following text as its value
+        # only if that text is a single short line; otherwise it is body.
+        for k, v in list(meta.items()):
+            if v == "":
+                if body_parts and len(body_parts[0]) <= 120 and "\n" not in body_parts[0]:
+                    meta[k] = body_parts.pop(0)
+                else:
+                    meta.pop(k)
+
+        doc_id = ""
+        for k in DOC_ID_KEYS:
+            if meta.get(k):
+                doc_id = meta[k]
+                break
+        if not doc_id and boundary and meta.get(boundary):
+            doc_id = meta[boundary]
+
+        out.append(Chunk(
+            text="\n\n".join(body_parts).strip(),
+            score=_coerce_float(meta.get("score") or meta.get("similarity")) or 0.0,
+            doc_id=doc_id or f"chunk_{i}",
+            metadata=meta,
+        ))
+
     stats.labelled_text_rows += 1
     return out
 
@@ -378,6 +485,9 @@ def run(df: "pd.DataFrame",
             stats.rows_with_scores += 1
         if any(c.metadata for c in chunks):
             stats.rows_with_metadata += 1
+        for c in chunks:
+            for k, v in (c.metadata or {}).items():
+                stats.key_values.setdefault(k, set()).add(v)
 
         f = _coerce_float(row[C["faithfulness_score"]])
         if f is not None:
@@ -490,13 +600,29 @@ def run(df: "pd.DataFrame",
     add("coverage", "rows_parsed_as_native_objects", stats.native_object_rows,
         "cell already held a list/dict")
     add("coverage", "rows_parsed_as_labelled_text", stats.labelled_text_rows,
-        "**File Name:** / **Document Title:** form")
+        "labelled `**Key:** value` form")
     add("coverage", "chunks_per_row_mean",
         round(statistics.fmean([len(i.chunks) for i in interactions]), 2),
         "if this is 1.0 the chunk delimiter was not recognised")
     add("coverage", "unparsed_dates", stats.unparsed_dates)
     add("coverage", "distance_converted_to_similarity", stats.distance_converted)
     add("coverage", "faithfulness_rescaled_from_0_100", int(stats.faithfulness_rescaled))
+    add("coverage", "rows_with_zero_chunks", stats.empty_chunks,
+        "pulls chunks_per_row_mean below 1.0")
+    add("coverage", "chunk_boundary_key", stats.boundary_key or "(none)",
+        "the labelled key used to split document blocks")
+
+    # Every labelled key discovered, with how many distinct values it takes.
+    # A key with FEW distinct values and which VARIES within a single answer is
+    # a branch dimension - the thing an asker must be pinned to (country,
+    # grade, contract type). A key with one distinct value per document is
+    # identity (file name, title). This is how you find out which attributes
+    # your corpus actually branches on, rather than guessing.
+    for k, vals in sorted(stats.key_values.items(), key=lambda kv: -len(kv[1])):
+        n = len(vals)
+        sample = ", ".join(sorted(list(vals))[:6])
+        add("discovered_key", k, n,
+            f"distinct values: {sample}" + (" ..." if n > 6 else ""))
 
     flag_counts: Dict[str, int] = {}
     for r in risks:
