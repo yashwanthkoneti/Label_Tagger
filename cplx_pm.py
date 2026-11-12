@@ -170,7 +170,13 @@ _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\-]*")
 # Structural, not lexical: counts distinct asks. Interrogative stems and
 # question marks are closed-class grammar, not business vocabulary, so this
 # generalises in a way the content lexicons of the earlier assessor did not.
-_WH = re.compile(r"\b(?:what|how|when|where|why|who|whom|which|whether)\b", re.IGNORECASE)
+# Only wh-words that OPEN a clause: at the start, after sentence punctuation,
+# or after a coordinator. A wh-word mid-clause is subordinate, not a second
+# question - "What happens WHEN I resign?" and "How do I know WHERE to submit?"
+# are one ask each, and counting bare wh-words flagged both as compound.
+_WH = re.compile(
+    r"(?:^|[.?!;]\s*|\b(?:and|or|also|additionally|plus|then)\s+)"
+    r"(?:what|how|when|where|why|who|whom|which|whether)\b", re.IGNORECASE)
 # "... and should I ...", "... or do we ..." -- a second clause with its own subject
 _MODAL_JOIN = re.compile(
     r"\b(?:and|or)\s+(?:can|could|should|would|will|do|does|did|is|are|was|were|must|may|might|am)\s+"
@@ -643,23 +649,33 @@ class Baseline:
         self.window = window
         self.min_n = min_n
         self._buf: Dict[str, deque] = {n: deque(maxlen=window) for n in SIGNAL_NAMES}
+        # mean/stdev are recomputed over the whole window, which is O(window).
+        # score_risk() calls z() several times per interaction, so without this
+        # cache scoring a batch is O(n^2): ~3x slower at 5k rows than at 1k, and
+        # unusable past ~50k. Invalidated on add().
+        self._stats_cache: Dict[str, Tuple[float, float]] = {}
 
     def add(self, sig: Signals) -> None:
         for n in SIGNAL_NAMES:
             if n in sig.values:
                 self._buf[n].append(sig.values[n])
+        self._stats_cache.clear()
 
     @property
     def ready(self) -> bool:
         return len(self._buf["top_score"]) >= self.min_n
 
     def stats(self, name: str) -> Tuple[float, float]:
+        hit = self._stats_cache.get(name)
+        if hit is not None:
+            return hit
         xs = list(self._buf[name])
         if len(xs) < 2:
-            return 0.0, 0.0
-        mu = statistics.fmean(xs)
-        sd = statistics.pstdev(xs)
-        return mu, sd
+            out = (0.0, 0.0)
+        else:
+            out = (statistics.fmean(xs), statistics.pstdev(xs))
+        self._stats_cache[name] = out
+        return out
 
     def z(self, name: str, value: float) -> float:
         mu, sd = self.stats(name)
