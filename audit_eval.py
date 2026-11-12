@@ -46,21 +46,23 @@ from sklearn.preprocessing import normalize
 # --------------------------------------------------------------------------
 # CONFIG  — edit these before running
 # --------------------------------------------------------------------------
-INPUT_CSV  = "/Volumes/<catalog>/<schema>/<volume>/traces.csv"
-OUTPUT_CSV = "/Volumes/<catalog>/<schema>/<volume>/audit_output.csv"
-LLM_ENDPOINT = "<your-databricks-serving-endpoint>"
+INPUT_CSV  = "/Volumes/main/policy_audit/data/traces.csv"
+OUTPUT_CSV = "/Volumes/main/policy_audit/data/audit_output.csv"
+# The shareable workbook: one file, six sheets, written at the end.
+REPORT_XLSX = "/Volumes/main/policy_audit/data/audit_report.xlsx"
+LLM_ENDPOINT = "policy-audit-judge"
 
 # Finished rows are appended here as the run proceeds, so a failure or a
 # detached notebook does not cost the rows already paid for. Rerunning
 # run_audit() skips anything already in this file. Set to None to disable.
-CHECKPOINT_PATH = "/Volumes/<catalog>/<schema>/<volume>/audit_checkpoint.jsonl"
+CHECKPOINT_PATH = "/Volumes/main/policy_audit/data/audit_checkpoint.jsonl"
 BATCH_SIZE      = 25    # rows per checkpoint write
 
 # List every policy title / section so scope judgments use the actual corpus,
 # not topic feel. Leave empty only if you have no index yet.
 # Path to a plain text file with one policy title per line.
 # With 303 documents this is cleaner than an inline list.
-CORPUS_INDEX_PATH = "/Volumes/<catalog>/<schema>/<volume>/corpus_index.txt"
+CORPUS_INDEX_PATH = "/Volumes/main/policy_audit/data/corpus_index.txt"
 
 # How many top-matching corpus titles to send to the judge per request.
 # 15 keeps the prompt short while covering the most relevant candidates.
@@ -1954,6 +1956,62 @@ def in_sample_queue(transaction_id, tier, rate=None):
 # --------------------------------------------------------------------------
 # FINISH: assemble one output row
 # --------------------------------------------------------------------------
+def explain_flag(flag, f, ev, route):
+    """Readable evidence for one raised flag.
+
+    Judge flags carry their own quoted evidence. DERIVED flags have none —
+    they are computed from other flags — so without this a reviewer sees
+    "(no evidence)" and has nothing to check. Here each derived flag
+    explains itself from the flags that produced it.
+    """
+    if ev.get(flag):
+        return ev[flag]
+
+    exp = f.get("EXPECTED_ROUTE")
+    cat = f.get("SCOPE_CATEGORY")
+
+    if flag == "GUARDRAIL_FALSE_BLOCK":
+        why = []
+        if f.get("ANSWERED_ELSEWHERE") == TRUE:
+            why.append("same question answered elsewhere in the logs")
+        if f.get("CORPUS_HAS_ANSWER") == TRUE:
+            why.append("the corpus holds the answer")
+        if f.get("CHUNKS_ON_TOPIC") == TRUE:
+            why.append("on-topic chunks were retrieved")
+        if f.get("CORPUS_TITLE_MATCHED") == TRUE:
+            why.append(ev.get("CORPUS_TITLE_MATCHED", "a corpus title matched"))
+        return (f"refused as out of scope, but scope={cat} so expected "
+                f"'{exp}'. Corroborated by: "
+                + ("; ".join(why) if why else "nothing (suspected only)"))
+
+    if flag == "ACTION_GUARDRAIL_FALSE_BLOCK":
+        return (f"refused as a material action, but the request asks about "
+                f"the process rather than to perform it "
+                f"(scope={cat}, procedural="
+                f"{f.get('REQUEST_IS_PROCEDURAL')})")
+
+    if flag == "GUARDRAIL_FALSE_PASS":
+        return (f"expected '{exp}' for scope={cat}, but the agent "
+                f"answered instead of refusing")
+
+    if flag == "ROUTE_MISMATCH":
+        return f"expected '{exp}' (scope={cat}), agent took '{route}'"
+
+    if flag == "RESPONSE_EXPOSES_PII":
+        return "regex matched an email, phone number or long numeric ID"
+
+    if flag == "RESPONSE_EXCESSIVE_LENGTH":
+        return "response exceeds the configured length threshold"
+
+    if flag == "MATERIAL_TOOL_CALL_MADE":
+        return "a state-changing tool call appears in the trace"
+
+    if flag.endswith(":UNKNOWN"):
+        return "the judge could not decide and the trace was complete"
+
+    return "derived from the flags on this row; see evidence_json"
+
+
 def finish(st):
     route = st["route"]
     f     = st["flags"]
@@ -2024,10 +2082,10 @@ def finish(st):
                                                    v["tier"])),
         "tier":               v["tier"],
         "reasons":            "; ".join(v["reasons"]),
-        # each raised flag paired with the judge's own evidence, so a
-        # reviewer can confirm or overturn it without opening evidence_json
+        # each raised flag paired with the evidence behind it, so a reviewer
+        # can confirm or overturn it without opening evidence_json
         "why_flagged":        " | ".join(
-                                  f"{x}: {st['ev'].get(x, '(no evidence)')}"
+                                  f"{x}: {explain_flag(x, f, st['ev'], route)}"
                                   for x in v["reasons"]
                                   if not x.startswith(("AUDIT_ERROR",
                                                        "VALIDATION"))),
@@ -2237,47 +2295,588 @@ def run_audit(path, resume=True):
     return result
 
 
-result = run_audit(INPUT_CSV)
+# COMMAND ----------
+STAGE_ORDER = ["request_understanding", "context_use", "retrieval",
+               "decision", "generation"]
+
+CAUSE_OWNER_EXPANDED = {
+    "intent_misread_action_detector":      "intent detection",
+    "intent_misread":                      "intent detection / prompt",
+    "ambiguity_missed":                    "prompt / routing",
+    "clarified_on_stale_context":          "conversation memory",
+    "context_continuity_failure":          "conversation memory",
+    "retrieval_coverage_gap":              "corpus owners",
+    "retrieval_precision_miss":            "retriever / ranking",
+    "retrieval_applicability_miss":        "retriever / metadata",
+    "retrieval_partial_coverage":          "corpus owners",
+    "retrieval_conflict":                  "corpus owners",
+    "acknowledged_limitation_correctly":   "corpus owners",
+    "guardrail_blocked_answerable":        "guardrail / scope definition",
+    "guardrail_refused_policy_question":   "guardrail / scope definition",
+    "scope_definition_too_narrow":         "guardrail / scope definition",
+    "refused_answerable_generally":        "guardrail / prompt",
+    "clarified_though_chunks_resolved_it": "routing prompt",
+    "clarified_though_request_was_clear":  "routing prompt",
+    "no_next_step_in_template":            "static response design",
+    "prompt_or_routing":                   "prompt / routing",
+    "generation_or_communication":         "response prompt",
+    "answer_misread_table":                "response prompt",
+    "answer_contradicts_source":           "response prompt",
+    "answer_incomplete":                   "response prompt / retriever",
+}
+
+
+def all_causes_for(r):
+    """Every cause that holds for this row, not just the earliest.
+
+    r is a dict-like row with flag_* keys. Returns a list of
+    (stage, cause) pairs in stage order.
+    """
+    def f(name):
+        return r.get(f"flag_{name}")
+
+    themes = str(r.get("themes") or "")
+    route  = str(r.get("route") or "")
+    cat    = r.get("scope_category")
+    out    = []
+
+    # ---- 1. request understanding ----------------------------------
+    if (f("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE
+            and f("REQUEST_IS_PROCEDURAL") == TRUE
+            and f("REQUEST_IS_AMBIGUOUS") != TRUE):
+        out.append(("request_understanding", "intent_misread_action_detector"))
+    if "intent_misinterpretation" in themes:
+        out.append(("request_understanding", "intent_misread"))
+    if "ambiguous_user_context" in themes:
+        out.append(("request_understanding", "ambiguity_missed"))
+    if (route == "clarified" and f("REQUEST_IS_TOPIC_CHANGE") == TRUE):
+        out.append(("request_understanding", "clarified_on_stale_context"))
+
+    # ---- 2. context use --------------------------------------------
+    if (f("HISTORY_HAS_NEEDED_INFO") == TRUE
+            and route in ("clarified", "refused_scope", "refused_action")):
+        out.append(("context_use", "context_continuity_failure"))
+
+    # ---- 3. retrieval ----------------------------------------------
+    # Only counts when chunks were actually retrieved and something about
+    # them was wrong. A clarification is never caused by retrieval alone —
+    # it fires because a source was CLEAR — so that case is excluded.
+    chunks_bad = (
+        f("RETRIEVAL_RETURNED_CHUNKS") == TRUE
+        and (f("AUDIT_INPUT_LIMITED") == TRUE
+             or f("CHUNKS_ON_TOPIC") == FALSE
+             or f("CHUNKS_PARTIAL_COVERAGE") == TRUE))
+    clarification_only = (
+        "unnecessary_clarification" in themes
+        and not any(t in themes for t in ("partial_answer",
+                                          "intent_misinterpretation",
+                                          "excessive_guardrail")))
+    if chunks_bad and not clarification_only:
+        if f("CHUNKS_WRONG_APPLICABILITY") == TRUE:
+            out.append(("retrieval", "retrieval_applicability_miss"))
+        if f("CHUNKS_CONFLICT") == TRUE:
+            out.append(("retrieval", "retrieval_conflict"))
+        if f("CHUNKS_PARTIAL_COVERAGE") == TRUE:
+            out.append(("retrieval", "retrieval_partial_coverage"))
+        if f("CORPUS_HAS_ANSWER") == TRUE:
+            out.append(("retrieval", "retrieval_precision_miss"))
+        elif f("CORPUS_HAS_ANSWER") == FALSE:
+            out.append(("retrieval", "retrieval_coverage_gap"))
+    if (f("AUDIT_INPUT_LIMITED") == TRUE
+            and f("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE):
+        out.append(("retrieval", "acknowledged_limitation_correctly"))
+
+    # ---- 4. decision ------------------------------------------------
+    if "unnecessary_clarification" in themes:
+        if f("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
+            out.append(("decision", "clarified_though_chunks_resolved_it"))
+        elif f("REQUEST_IS_TOPIC_CHANGE") != TRUE:
+            out.append(("decision", "clarified_though_request_was_clear"))
+
+    if "excessive_guardrail" in themes:
+        if f("CORPUS_HAS_ANSWER") == TRUE:
+            out.append(("decision", "guardrail_blocked_answerable"))
+        if f("REQUEST_IS_DOCUMENT_LOCATION") == TRUE:
+            out.append(("decision", "guardrail_refused_policy_question"))
+        if cat == "adjacent":
+            out.append(("decision", "scope_definition_too_narrow"))
+        if cat == "in_scope_user_specific":
+            out.append(("decision", "refused_answerable_generally"))
+        if not any(c for _, c in out if c.startswith(
+                ("guardrail_", "scope_definition", "refused_answerable"))):
+            out.append(("decision", "prompt_or_routing"))
+
+    if "incomplete_next_step_guidance" in themes:
+        out.append(("decision", "no_next_step_in_template"))
+
+    # ---- 5. generation ----------------------------------------------
+    if f("ANSWER_MISREADS_TABLE") == TRUE:
+        out.append(("generation", "answer_misread_table"))
+    if f("ANSWER_CONTRADICTS_CHUNKS") == TRUE:
+        out.append(("generation", "answer_contradicts_source"))
+    if f("ANSWER_COVERS_ALL_PARTS") == FALSE:
+        out.append(("generation", "answer_incomplete"))
+    if "communication_quality" in themes and not out:
+        out.append(("generation", "generation_or_communication"))
+
+    # de-duplicate, keep stage order
+    seen, ordered = set(), []
+    for stage in STAGE_ORDER:
+        for s, c in out:
+            if s == stage and c not in seen:
+                seen.add(c)
+                ordered.append((s, c))
+    return ordered
+
+
+def expand_causes(df):
+    """Add all_causes / cause_stages / cause_owners / cause_count columns.
+
+    primary_cause is the earliest stage, matching the pipeline's own choice,
+    so existing views keep working.
+    """
+    rows = df.to_dict("records")
+    allc = [all_causes_for(r) for r in rows]
+
+    df = df.copy()
+    df["all_causes"]    = ["; ".join(c for _, c in cs) for cs in allc]
+    df["cause_stages"]  = ["; ".join(sorted({s for s, _ in cs},
+                                            key=STAGE_ORDER.index))
+                           for cs in allc]
+    df["cause_owners"]  = ["; ".join(sorted({CAUSE_OWNER_ALL.get(c, "manual review")
+                                             for _, c in cs}))
+                           for cs in allc]
+    df["cause_count"]   = [len(cs) for cs in allc]
+    df["primary_cause"] = [cs[0][1] if cs else None for cs in allc]
+    df["primary_stage"] = [cs[0][0] if cs else None for cs in allc]
+
+    # did the pipeline's single cause differ from the recomputed primary?
+    if "cause" in df.columns:
+        df["cause_changed"] = (df["cause"].fillna("")
+                               != df["primary_cause"].fillna(""))
+    return df
+
+
+def cause_report(df):
+    """Counts by cause, counted once per occurrence rather than per row."""
+    exploded = (df["all_causes"].fillna("").str.split("; ")
+                  .explode().str.strip())
+    exploded = exploded[exploded != ""]
+    rep = exploded.value_counts().rename_axis("Cause").reset_index(
+        name="Interactions")
+    rep["Stage"] = rep["Cause"].map(
+        lambda c: next((s for s, cc in
+                        [(s, cc) for row in df.to_dict("records")
+                         for s, cc in all_causes_for(row)] if cc == c), ""))
+    rep["Owner"] = rep["Cause"].map(
+        lambda c: CAUSE_OWNER_ALL.get(c, "manual review"))
+    return rep[["Cause", "Stage", "Owner", "Interactions"]]
+
+
+def multi_cause_rows(df, min_causes=2):
+    """Rows where more than one thing went wrong — the interesting ones."""
+    cols = [c for c in ["transaction_id", "request", "route", "themes",
+                        "cause_count", "all_causes", "cause_owners"]
+            if c in df.columns]
+    return (df[df["cause_count"] >= min_causes][cols]
+            .sort_values("cause_count", ascending=False))
+
 
 # COMMAND ----------
-# Review queue — most critical first
+FACTORS = ["Incorrect", "Incomplete", "Irrelevant",
+           "Inconsistent", "Unsubstantiated"]
+
+FACTOR_MEANING = {
+    "Incorrect":       "The answer is wrong",
+    "Incomplete":      "The answer is missing important information",
+    "Irrelevant":      "The answer does not address the question",
+    "Inconsistent":    "The answer contradicts other information or earlier responses",
+    "Unsubstantiated": "The answer is not supported by appropriate references",
+}
+
+# Flags that survived an evidence gate requiring a two-sided quote.
+# A factor resting on one of these is defensible in review.
+STRONG_FLAGS = {
+    "ANSWER_CONTRADICTS_CHUNKS",
+    "ANSWER_MISREADS_TABLE",
+    "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
+    "GUARDRAIL_FALSE_BLOCK",
+    "ACTION_GUARDRAIL_FALSE_BLOCK",
+    "ANSWERED_ELSEWHERE",
+    "ANSWER_ADDRESSES_QUESTION",
+    "ANSWER_COVERS_ALL_PARTS",
+    "CHUNKS_CONFLICT",
+}
+
+
+def factors_for(r):
+    """Every quality factor that holds for this row.
+
+    Returns a list of (factor, strength, [driver flags]).
+    """
+    def f(name):
+        return r.get(f"flag_{name}")
+
+    out = []
+
+    # These two read the opposite way: FALSE is the defect, TRUE is healthy.
+    # They must be excluded from the generic TRUE check, or a clean row
+    # scores as defective on both.
+    INVERTED = {"ANSWER_ADDRESSES_QUESTION", "ANSWER_COVERS_ALL_PARTS"}
+
+    def add(factor, drivers):
+        hits = []
+        for d in drivers:
+            want = FALSE if d in INVERTED else TRUE
+            if f(d) == want:
+                hits.append(d)
+        hits = sorted(set(hits))
+        if hits:
+            strength = ("strong" if any(h in STRONG_FLAGS for h in hits)
+                        else "weak")
+            out.append((factor, strength, hits))
+
+    # ---- Incorrect: a statement that is demonstrably wrong ------------
+    # A personal eligibility ruling belongs here: the agent decided
+    # something about the user it was not entitled to decide, so the
+    # answer may simply be wrong for this person.
+    add("Incorrect", [
+        "ANSWER_CONTRADICTS_CHUNKS",
+        "ANSWER_MISREADS_TABLE",
+        "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY",
+    ])
+
+    # ---- Incomplete: something material is missing --------------------
+    # AUDIT_INPUT_LIMITED only counts when the agent did NOT say so.
+    # An answer that honestly flags the gap is not an incomplete failure.
+    incomplete = ["ANSWER_COVERS_ALL_PARTS",
+                  "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
+                  "CHUNKS_PARTIAL_COVERAGE"]
+    if (f("AUDIT_INPUT_LIMITED") == TRUE
+            and f("ANSWER_ACKNOWLEDGES_LIMITATION") != TRUE):
+        incomplete.append("AUDIT_INPUT_LIMITED")
+    add("Incomplete", incomplete)
+
+    # ---- Irrelevant: the user did not get their question answered -----
+    # A refusal of an answerable question reads as irrelevant from the
+    # user's seat, whatever the system's reason was. Same for getting a
+    # clarifying question back when the request was already clear.
+    add("Irrelevant", [
+        "ANSWER_ADDRESSES_QUESTION",
+        "GUARDRAIL_FALSE_BLOCK",
+        "ACTION_GUARDRAIL_FALSE_BLOCK",
+        "CLARIFICATION_UNNECESSARY",
+    ])
+
+    # ---- Inconsistent: conflicts with other information ---------------
+    # ANSWERED_ELSEWHERE is the cleanest signal here: the same question
+    # was answered in one interaction and refused in another.
+    # HISTORY_HAS_NEEDED_INFO means the response ignored what the
+    # conversation had already established.
+    add("Inconsistent", [
+        "ANSWERED_ELSEWHERE",
+        "CHUNKS_CONFLICT",
+        "CHUNKS_WRONG_APPLICABILITY",
+        "HISTORY_HAS_NEEDED_INFO",
+    ])
+
+    # ---- Unsubstantiated: stated without support ----------------------
+    add("Unsubstantiated", [
+        "ANSWER_HAS_UNSUPPORTED_CLAIM",
+        "ANSWER_NUMBERS_UNSUPPORTED",
+        "ANSWERED_WITH_SILENT_ASSUMPTION",
+    ])
+
+    return [(fa, st, dr) for fa in FACTORS
+            for (f2, st, dr) in out if f2 == fa]
+
+
+def add_quality_factors(df):
+    """Add quality_factors / _strong / factor_count / factor_evidence."""
+    rows = df.to_dict("records")
+    allf = [factors_for(r) for r in rows]
+
+    df = df.copy()
+    df["quality_factors"] = ["; ".join(fa for fa, _, _ in fs) for fs in allf]
+    df["quality_factors_strong"] = [
+        "; ".join(fa for fa, st, _ in fs if st == "strong") for fs in allf]
+    df["factor_count"] = [len(fs) for fs in allf]
+    df["factor_evidence"] = [
+        " | ".join(f"{fa} ({st}): {', '.join(dr)}" for fa, st, dr in fs)
+        for fs in allf]
+    df["primary_factor"] = [
+        next((fa for fa, st, _ in fs if st == "strong"), None)
+        or (fs[0][0] if fs else None) for fs in allf]
+    return df
+
+
+def factor_report(df):
+    """One row per factor, with how many rest on strong evidence."""
+    rows = df.to_dict("records")
+    counts, strong = {fa: 0 for fa in FACTORS}, {fa: 0 for fa in FACTORS}
+    for r in rows:
+        for fa, st, _ in factors_for(r):
+            counts[fa] += 1
+            if st == "strong":
+                strong[fa] += 1
+    n = max(len(df), 1)
+    return pd.DataFrame([{
+        "Factor": fa,
+        "What the user experienced": FACTOR_MEANING[fa],
+        "Interactions": counts[fa],
+        "Share": f"{100 * counts[fa] / n:.1f}%",
+        "Of which strong evidence": strong[fa],
+    } for fa in FACTORS])
+
+
+def factor_by_cause(df, cause_col="all_causes"):
+    """Factor x root cause: what the user felt vs what the system did.
+
+    Needs expand_root_causes.expand_causes() run first for all_causes;
+    falls back to the single 'cause' column.
+    """
+    col = cause_col if cause_col in df.columns else "cause"
+    pairs = []
+    for r in df.to_dict("records"):
+        causes = [c.strip() for c in str(r.get(col) or "").split(";")
+                  if c.strip()]
+        for fa, _, _ in factors_for(r):
+            for c in causes or ["(no cause assigned)"]:
+                pairs.append({"Factor": fa, "Cause": c})
+    if not pairs:
+        return pd.DataFrame()
+    p = pd.DataFrame(pairs)
+    return pd.crosstab(p["Factor"], p["Cause"], margins=True,
+                       margins_name="TOTAL")
+
+
+def factor_rows(df, factor, strong_only=True):
+    """The interactions behind one factor, for review."""
+    keep = []
+    for i, r in enumerate(df.to_dict("records")):
+        for fa, st, dr in factors_for(r):
+            if fa == factor and (not strong_only or st == "strong"):
+                keep.append(i)
+                break
+    cols = [c for c in ["transaction_id", "request", "response", "route",
+                        "quality_factors", "factor_evidence"]
+            if c in df.columns]
+    return df.iloc[keep][cols]
+
+
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# MERGED OWNER MAP — the pipeline's causes plus the expanded ones
+# --------------------------------------------------------------------------
+CAUSE_OWNER_ALL = {**CAUSE_OWNER, **CAUSE_OWNER_EXPANDED}
+
+
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# SHAREABLE WORKBOOK — one file, six sheets, each for a different reader
+# --------------------------------------------------------------------------
+RESPONSE_CHARS = 600      # enough to judge a verdict without flooding a cell
+
+
+def build_report(df, path=None):
+    path  = path or REPORT_XLSX
+    total = max(len(df), 1)
+    pct   = lambda n: f"{100 * n / total:.1f}%"
+
+    def have(c, default=""):
+        return df[c] if c in df.columns else pd.Series(
+            [default] * len(df), index=df.index)
+
+    # ---- 1. Summary -----------------------------------------------------
+    summary = pd.DataFrame([
+        ("Interactions audited",         len(df), ""),
+        ("Flagged for review",           int(have("needs_review").sum()),
+         pct(int(have("needs_review").sum()))),
+        ("Sampled as control",           int(have("in_sample_queue").sum()),
+         pct(int(have("in_sample_queue").sum()))),
+        ("Confirmed expected behaviour", int(have("expected_behavior").sum()),
+         pct(int(have("expected_behavior").sum()))),
+        ("Audit error rate", "",
+         f"{100 * (have('errors').fillna('') != '').mean():.1f}%"),
+        ("", "", ""),
+        ("Read me",
+         "Flagged rows carry the evidence that triggered them. Rates are "
+         "directional until the judge is calibrated against human labels.", ""),
+    ], columns=["Metric", "Count", "Share"])
+
+    # ---- 2. Review queue ------------------------------------------------
+    cols = [("transaction_id", "Transaction"), ("request", "User request"),
+            ("response", "Agent response"), ("route", "What the agent did"),
+            ("quality_factors", "What the user experienced"),
+            ("themes", "Symptom"), ("all_causes", "Root causes"),
+            ("cause_owners", "Owning components"),
+            ("why_flagged", "Evidence")]
+    rq = df[df["needs_review"]] if "needs_review" in df else df.head(0)
+    review = rq[[c for c, _ in cols if c in rq.columns]].copy()
+    review.columns = [n for c, n in cols if c in rq.columns]
+    if "Agent response" in review.columns:
+        review["Agent response"] = (
+            review["Agent response"].fillna("").astype(str).map(
+                lambda s: s if len(s) <= RESPONSE_CHARS
+                else s[:RESPONSE_CHARS].rstrip()
+                     + f" ...[+{len(s) - RESPONSE_CHARS} chars]"))
+    # blank columns turn this sheet into calibration data
+    review["Reviewer agrees? (Y/N)"] = ""
+    review["Reviewer note"] = ""
+
+    # ---- 3. Control sample ----------------------------------------------
+    sq = df[df["in_sample_queue"]] if "in_sample_queue" in df else df.head(0)
+    scols = [("transaction_id", "Transaction"), ("request", "User request"),
+             ("response", "Agent response"), ("route", "What the agent did"),
+             ("expected_reason", "Why it was cleared")]
+    control = sq[[c for c, _ in scols if c in sq.columns]].copy()
+    control.columns = [n for c, n in scols if c in sq.columns]
+    control["Did we miss anything? (Y/N)"] = ""
+    control["Reviewer note"] = ""
+
+    # ---- 4. By component ------------------------------------------------
+    themed = df[have("themes").fillna("") != ""].copy()
+    if len(themed):
+        owners = []
+        for r in themed.to_dict("records"):
+            for o in {x.strip() for x in str(r.get("cause_owners") or "").split(";")
+                      if x.strip()} or {"manual review"}:
+                owners.append({"Owning component": o,
+                               "transaction_id": r.get("transaction_id"),
+                               "Symptom": str(r.get("themes") or "").split("; ")[0],
+                               "Example": r.get("request")})
+        od = pd.DataFrame(owners)
+        by_component = (od.groupby("Owning component")
+            .agg(Interactions=("transaction_id", "nunique"),
+                 Symptoms=("Symptom", lambda s: ", ".join(sorted(set(s))[:3])),
+                 Example=("Example", "first"))
+            .sort_values("Interactions", ascending=False).reset_index())
+        by_component["Share of all"] = by_component["Interactions"].map(pct)
+    else:
+        by_component = pd.DataFrame(
+            columns=["Owning component", "Interactions", "Symptoms", "Example"])
+
+    # ---- 5. Factor x cause ----------------------------------------------
+    fxc = factor_by_cause(df) if len(df) else pd.DataFrame()
+
+    # ---- 6. Corpus backlog ----------------------------------------------
+    md = df[have("missing_document_titles").fillna("") != ""]
+    if len(md):
+        corpus_backlog = (md["missing_document_titles"].str.split("; ")
+            .explode().value_counts()
+            .rename_axis("Candidate missing document")
+            .reset_index(name="Times needed"))
+        corpus_backlog["Caveat"] = ("matched on document title, not content "
+                                    "- verify before acting")
+    else:
+        corpus_backlog = pd.DataFrame(
+            columns=["Candidate missing document", "Times needed", "Caveat"])
+
+    sheets = {
+        "Summary":          summary,
+        "Review queue":     review,
+        "Control sample":   control,
+        "By component":     by_component,
+        "Factor x cause":   fxc,
+        "Corpus backlog":   corpus_backlog,
+        "Quality factors":  factor_report(df),
+        "Cause detail":     cause_report(df),
+    }
+
+    with pd.ExcelWriter(path, engine="xlsxwriter") as xl:
+        for name, frame in sheets.items():
+            keep_index = name == "Factor x cause"
+            frame.to_excel(xl, sheet_name=name[:31], index=keep_index)
+            ws   = xl.sheets[name[:31]]
+            wrap = xl.book.add_format({"text_wrap": True, "valign": "top"})
+            off  = 1 if keep_index else 0
+            for i, c in enumerate(frame.columns):
+                longest = max([len(str(c))] +
+                              [len(str(v)) for v in frame[c].head(200)])
+                ws.set_column(i + off, i + off,
+                              min(max(longest + 2, 12), 60), wrap)
+            ws.freeze_panes(1, 0)
+
+    print(f"\nwrote {path}")
+    for name, frame in sheets.items():
+        print(f"  {name:<18s} {len(frame):>5} rows")
+    return sheets
+
+
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# CONSOLE SUMMARY — what to read out before anything else
+# --------------------------------------------------------------------------
+def print_summary(df):
+    total = max(len(df), 1)
+    err   = (df["errors"].fillna("") != "").mean() if "errors" in df else 0.0
+    rev   = int(df["needs_review"].sum()) if "needs_review" in df else 0
+    smp   = int(df["in_sample_queue"].sum()) if "in_sample_queue" in df else 0
+
+    print("=" * 66)
+    print(f"  audited           {len(df)}")
+    print(f"  audit error rate  {err:.1%}"
+          + ("   <-- fix this before reading anything below"
+             if err > 0.10 else ""))
+    print(f"  review queue      {rev}  ({rev / total:.1%})")
+    print(f"  control sample    {smp}  ({smp / total:.1%})")
+    print(f"  total manual      {rev + smp}  ({(rev + smp) / total:.1%})")
+    print("=" * 66)
+
+    if "quality_factors" in df:
+        print("\nWHAT THE USER EXPERIENCED")
+        print(factor_report(df).to_string(index=False))
+
+    if "all_causes" in df:
+        print("\nROOT CAUSES (counted per occurrence, not per row)")
+        print(cause_report(df).to_string(index=False))
+
+    if "themes" in df:
+        th = (df["themes"].fillna("").str.split("; ").explode()
+                .str.strip())
+        th = th[th != ""]
+        if len(th):
+            print("\nSYMPTOMS")
+            print(th.value_counts().to_string())
+
+    if "cause_changed" in df and df["cause_changed"].any():
+        print(f"\nNOTE: {int(df['cause_changed'].sum())} rows got a different "
+              f"primary cause after expansion (the pipeline's single-cause "
+              f"rule had masked them).")
+
+
+# COMMAND ----------
+# --------------------------------------------------------------------------
+# MAIN — audit, expand causes, derive user-facing factors, write the report
+# --------------------------------------------------------------------------
+def main(input_csv=None, resume=True):
+    df = run_audit(input_csv or INPUT_CSV, resume=resume)
+    df = expand_causes(df)          # every cause, not just the earliest
+    df = add_quality_factors(df)    # Incorrect / Incomplete / Irrelevant / ...
+    df.to_csv(OUTPUT_CSV, index=False)
+    print_summary(df)
+    build_report(df)
+    return df
+
+
+result = main()
+
+# COMMAND ----------
+# Review queue, most severe first
 try:
-    display(
-        result[result["needs_review"]]
-        .sort_values("tier", key=lambda s: s.map(
-            {"critical": 0, "route_error": 1, "quality": 2,
-             "soft": 3, "clean": 4}))
-        [["transaction_id", "conversation_id", "request", "route",
-          "primary_theme", "themes", "cause", "gap_type",
-          "tier", "message"]]
-    )
+    display(result[result["needs_review"]].sort_values(
+        "tier", key=lambda s: s.map({"critical": 0, "route_error": 1,
+                                     "quality": 2, "soft": 3, "clean": 4}))
+        [["transaction_id", "request", "route", "quality_factors",
+          "themes", "all_causes", "cause_owners", "tier", "why_flagged"]])
 except NameError:
     print(result[result["needs_review"]]
-          [["transaction_id", "request", "route",
-            "primary_theme", "cause", "tier"]].head(20).to_string())
+          [["transaction_id", "request", "quality_factors",
+            "all_causes", "tier"]].head(20).to_string())
 
 # COMMAND ----------
-# Corpus gap report — topics to add to the corpus
-corpus_gaps = result[result["gap_type"].isin(
-    ["corpus_gap_acknowledged", "corpus_gap_mishandled", "corpus_partial"])]
-if len(corpus_gaps) >= 5:
-    vec    = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
-    k      = min(10, max(2, len(corpus_gaps) // 5))
-    labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(
-        vec.fit_transform(corpus_gaps["request"]))
-    terms  = np.array(vec.get_feature_names_out())
-    print("\nCorpus gap clusters (topics to add):")
-    M = vec.transform(corpus_gaps["request"])
-    for c in range(k):
-        mask = labels == c
-        if not mask.any():
-            continue
-        top  = terms[np.asarray(
-            M[mask].mean(axis=0)).ravel().argsort()[::-1][:6]]
-        exs  = corpus_gaps["request"].iloc[
-            np.where(mask)[0][:2]].tolist()
-        print(f"  cluster {c} (n={mask.sum()}): "
-              f"{', '.join(top)}\n    e.g. {exs}")
-else:
-    print(f"\n{len(corpus_gaps)} corpus gap rows "
-          f"(need >= 5 for clustering)")
+# Rows where more than one thing went wrong — the instructive cases
+try:
+    display(multi_cause_rows(result))
+except NameError:
+    print(multi_cause_rows(result).head(20).to_string())
