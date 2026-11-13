@@ -836,20 +836,42 @@ def _driver_frame():
 def build_charts():
     nfull = max(len(audit_full), 1)
 
-    def cnt(col):
+    def mask(col):
         c = _col(col)
-        return int(audit_full[c].map(_val).eq(TRUE).sum()) if c else 0
+        return (audit_full[c].map(_val).eq(TRUE) if c
+                else pd.Series(False, index=audit_full.index))
 
-    n_exp, n_rev, n_samp = (cnt("expected_behavior"), cnt("needs_review"),
-                            cnt("in_sample_queue"))
+    m_rev, m_samp = mask("needs_review"), mask("in_sample_queue")
+    m_exp = mask("expected_behavior")
+
+    # expected_behavior may be blank or absent after a round-trip through
+    # the store. Without the fallback every row falls into the leftover
+    # bucket and the headline reads 0% expected, which is not a finding.
+    exp_derived = not m_exp.any()
+    if exp_derived:
+        ec = _col("expected_behavior")
+        vals = (dict(audit_full[ec].map(_val).value_counts()) if ec
+                else "column absent")
+        print(f"\nnote: expected_behavior carries no TRUE values ({vals}).")
+        print("      Falling back to 'not flagged for review' as the "
+              "cleared set. The chart says 'derived' where this applies.")
+        # anything not raised and not sampled is cleared
+        m_exp = ~m_rev & ~m_samp
+
+    n_exp  = int(m_exp.sum())
+    n_rev  = int(m_rev.sum())
+    n_samp = int((m_samp & ~m_rev).sum())
     n_rest = max(nfull - n_exp - n_rev - n_samp, 0)
+
+    exp_word = ("cleared — no defect raised (derived)" if exp_derived
+                else "confirmed expected behaviour")
 
     # --- 1. Headline: how much was expected -------------------------
     fig, ax = plt.subplots(figsize=(9, 1.6))
     ax.axis("off")
     ax.text(0, .72, f"{100 * n_exp / nfull:.0f}%", fontsize=46,
             fontweight="bold", color=OK_C, va="center")
-    ax.text(.22, .80, "of interactions were confirmed expected behaviour",
+    ax.text(.22, .80, f"of interactions were {exp_word}",
             fontsize=13, color=INK, va="center")
     ax.text(.22, .46, f"{nfull:,} audited   ·   {n_rev:,} flagged for review "
                       f"({100 * n_rev / nfull:.0f}%)   ·   {n_samp:,} control "
@@ -858,10 +880,14 @@ def build_charts():
     _finish(fig, ax, "01_headline", grid_axis="y")
 
     # --- 2. Triage split --------------------------------------------
-    lab = ["Expected behaviour", "Flagged for review",
-           "Control sample", "Cleared, unsampled"]
+    lab = ["Cleared (derived)" if exp_derived else "Expected behaviour",
+           "Flagged for review", "Control sample", "Unclassified"]
     val = [n_exp, n_rev, n_samp, n_rest]
     col = [OK_C, BAD_C, CAT[0], "#b9b8b2"]
+    # drop an empty leftover bucket rather than drawing a zero bar
+    keep = [i for i, v in enumerate(val) if v > 0 or i < 3]
+    lab, val, col = ([lab[i] for i in keep], [val[i] for i in keep],
+                     [col[i] for i in keep])
     fig, ax = plt.subplots(figsize=(9, 3.1))
     bars = ax.barh(lab, val, color=col, height=.62, zorder=3)
     _label_barh(ax, bars, val)
@@ -874,10 +900,10 @@ def build_charts():
     _finish(fig, ax, "02_triage", "interactions")
 
     # --- 3. Route x expected vs defect -------------------------------
-    rc, ec = _col("route") or "route", _col("expected_behavior")
-    if rc in audit_full.columns and ec:
+    rc = _col("route") or "route"
+    if rc in audit_full.columns:
         t = audit_full.copy()
-        t["ok"] = t[ec].map(lambda v: _val(v) == TRUE)
+        t["ok"] = m_exp.values     # same definition as the headline
         g = t.groupby(rc)["ok"].agg(["sum", "count"])
         g["defect"] = g["count"] - g["sum"]
         g = g.sort_values("count")
