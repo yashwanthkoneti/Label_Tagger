@@ -668,18 +668,48 @@ else:
 # notebook, or set CHARTS_HTML to save one shareable file.
 CHARTS_HTML = None          # e.g. "/tmp/audit_charts.html"
 
+# How to render inline.
+#   "html" - IPython.display.HTML. Works WITHOUT nbformat. Default.
+#   "show" - plotly fig.show(). Needs nbformat >= 4.2.0 installed.
+#   "none" - render nothing inline; use CHARTS_HTML to save a file instead.
+CHART_RENDER = "html"
+
 PALETTE = {"strong": "#1f6f4a", "weak": "#c9a227",
            "expected": "#2f7d55", "defect": "#b8562f",
            "review": "#b8562f", "sample": "#4a7ba7", "cleared": "#8aa79b"}
 
 
+def _render(figs):
+    """Render inline without requiring nbformat.
+
+    fig.show() goes through plotly's mime-type renderer, which raises
+    "mime type rendering requires nbformat>=4.2.0" when that package is
+    absent. Handing the HTML straight to IPython skips that path.
+    """
+    if CHART_RENDER == "show":
+        for _, fig in figs:
+            fig.show()
+        return
+    try:
+        from IPython.display import HTML, display
+    except ImportError:
+        print("no IPython available - set CHARTS_HTML to save a file instead")
+        return
+    for i, (name, fig) in enumerate(figs):
+        # load plotly.js once, from CDN, on the first chart only
+        html = fig.to_html(full_html=False,
+                           include_plotlyjs="cdn" if i == 0 else False)
+        display(HTML(html))
+
+
 def build_charts(show=True, html_path=None):
     try:
         import plotly.express as px
-        import plotly.graph_objects as go
     except ImportError:
-        print("\nplotly not installed - skipping charts. "
-              "Install with: pip install plotly")
+        print("\nplotly not installed - skipping charts.")
+        print("  pip install plotly")
+        print("  (px.bar and px.imshow are all this uses; both ship with "
+              "the base plotly package)")
         return []
 
     figs = []
@@ -819,9 +849,8 @@ def build_charts(show=True, html_path=None):
                 f7.update_layout(height=360)
                 figs.append(("weekly", f7))
 
-    if show:
-        for _, fig in figs:
-            fig.show()
+    if show and CHART_RENDER != "none":
+        _render(figs)
     if html_path:
         with open(html_path, "w") as fh:
             fh.write("<html><body style='font-family:sans-serif'>")
