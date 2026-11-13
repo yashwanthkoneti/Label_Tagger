@@ -47,8 +47,98 @@ if "document_chunks" in traces.columns and "document_chunks" not in audit.column
     print(f"chunks attached to {audit['document_chunks'].notna().sum()}/{len(audit)} rows")
 
 
+# ---- SCOPE OF THE ANALYSIS ---------------------------------------------
+# CHUNKS_ONLY: drop rows with no source chunks. The chunk-based flags could
+#   never have been judged on those, so they quietly depress every rate.
+# THEMED_ONLY: keep only rows the audit gave a theme. See the warning below
+#   before turning this on — it excludes the generation defects.
+CHUNKS_ONLY = True
+THEMED_ONLY = True
+
+_start = len(audit)
+
+if CHUNKS_ONLY and "document_chunks" in audit.columns:
+    _blank = audit["document_chunks"].astype(str).str.strip().isin(
+        ["", "[]", "null", "None", "nan"])
+    has = audit["document_chunks"].notna() & (~_blank)
+    dropped = int((~has).sum())
+    audit = audit[has].copy()
+    print(f"\nchunks filter : kept {len(audit)}, dropped {dropped} "
+          f"with no chunks")
+elif CHUNKS_ONLY:
+    print("\nwarning: no document_chunks column - chunks filter skipped")
+
+# Flags that produce NO theme, because themes_for covers routing and
+# coverage defects but not generation defects. A themed-only filter
+# removes these rows even though they carry the strongest evidence.
+THEMELESS_FLAGS = ["ANSWER_CONTRADICTS_CHUNKS", "ANSWER_MISREADS_TABLE",
+                   "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY", "CHUNKS_CONFLICT"]
+
+if THEMED_ONLY:
+    _theme_col = next((c for c in audit.columns
+                       if c.lower() in ("primary_theme", "themes")), None)
+    if _theme_col:
+        keep = (audit[_theme_col].notna()
+                & (audit[_theme_col].astype(str).str.strip()
+                   .isin(["", "nan", "None"]) == False))
+        losing = audit[~keep]
+
+        # how many of the dropped rows carried a strong generation defect?
+        lost_strong = {}
+        for fl in THEMELESS_FLAGS:
+            c = next((c for c in losing.columns
+                      if c.lower() == f"flag_{fl}".lower()), None)
+            if c is not None:
+                n = int((losing[c].astype(str).str.strip().str.upper()
+                         == "TRUE").sum())
+                if n:
+                    lost_strong[fl] = n
+
+        audit = audit[keep].copy()
+        print(f"theme filter  : kept {len(audit)}, dropped "
+              f"{int((~keep).sum())} with no theme")
+        if lost_strong:
+            print("\n  WARNING: the theme filter just removed rows carrying "
+                  "strong evidence:")
+            for fl, n in sorted(lost_strong.items(), key=lambda x: -x[1]):
+                print(f"    {fl:38s} {n} rows")
+            print("  These are generation defects. themes_for has no theme "
+                  "for them,\n  so filtering on themes excludes them. Set "
+                  "THEMED_ONLY = False to keep them.")
+    else:
+        print("warning: no primary_theme/themes column - theme filter skipped")
+
+print(f"\nanalysing {len(audit)} of {_start} interactions")
+
+
 # ---- FACTOR DEFINITIONS -------------------------------------------------
 TRUE, FALSE = "TRUE", "FALSE"
+
+# Hive and Spark lowercase column names, so flag_ANSWER_X arrives as
+# flag_answer_x. Look columns up case-insensitively, or every flag reads as
+# missing and every factor comes out zero.
+COLMAP = {c.lower(): c for c in audit.columns}
+
+
+def _col(name):
+    return COLMAP.get(str(name).lower())
+
+
+def _val(v):
+    """Normalise TRUE/FALSE however the store wrote them."""
+    if isinstance(v, bool):
+        return TRUE if v else FALSE
+    s = str(v).strip().upper()
+    if s in ("TRUE", "T", "1", "1.0", "Y", "YES"):
+        return TRUE
+    if s in ("FALSE", "F", "0", "0.0", "N", "NO"):
+        return FALSE
+    return s
+
+
+def flagval(r, flag):
+    c = _col(f"flag_{flag}")
+    return _val(r.get(c)) if c else None
 
 FACTORS = {
     "Incorrect":       "The answer is wrong",
@@ -88,27 +178,65 @@ def factor_row(r):
     Only populated when the audit did NOT clear the row as expected
     behaviour — a row judged correct cannot also be a user complaint.
     """
-    if r.get("expected_behavior") in (True, "True", "true"):
+    exp_c = _col("expected_behavior")
+    if exp_c and _val(r.get(exp_c)) == TRUE:
         return {}
 
     def fires(flag):
-        v = r.get(f"flag_{flag}")
-        return v == (FALSE if flag in INVERTED else TRUE)
+        return flagval(r, flag) == (FALSE if flag in INVERTED else TRUE)
 
     out = {}
     for factor, flags in DRIVERS.items():
         hits = [f for f in flags if fires(f)]
         # an acknowledged corpus gap is honest behaviour, not Incomplete
         if (factor == "Incomplete" and "AUDIT_INPUT_LIMITED" in hits
-                and r.get("flag_ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE):
+                and flagval(r, "ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE):
             hits.remove("AUDIT_INPUT_LIMITED")
         if hits:
             out[factor] = hits
     return out
 
 
+# ---- DIAGNOSTIC ---------------------------------------------------------
+# Everything coming out zero almost always means the flag columns were not
+# found, not that the agent was perfect. Check before trusting any table.
+all_drivers = sorted({f for fl in DRIVERS.values() for f in fl})
+found   = [f for f in all_drivers if _col(f"flag_{f}")]
+missing = [f for f in all_drivers if not _col(f"flag_{f}")]
+
+print("\n" + "=" * 78)
+print("DIAGNOSTIC")
+print("=" * 78)
+print(f"flag_* columns in dataset : "
+      f"{sum(1 for c in audit.columns if c.lower().startswith('flag_'))}")
+print(f"driver flags found        : {len(found)}/{len(all_drivers)}")
+if missing:
+    print(f"driver flags MISSING      : {', '.join(missing)}")
+if not found:
+    print("\n>> No driver flags found, so every factor will be zero.")
+    print("   Columns actually present:")
+    print("  ", list(audit.columns)[:25])
+    raise SystemExit("flag columns not found - fix the column names first")
+
+for f in found[:6]:
+    vc = audit[_col(f"flag_{f}")].map(_val).value_counts().to_dict()
+    print(f"   {f:36s} {vc}")
+
+exp_c = _col("expected_behavior")
+if exp_c:
+    print(f"\nexpected_behavior values  : "
+          f"{audit[exp_c].map(_val).value_counts().to_dict()}")
+else:
+    print("\nnote: no expected_behavior column, so no row is cleared and "
+          "factor counts will run higher than the audit intended")
+
 rows = audit.to_dict("records")
 facts = [factor_row(r) for r in rows]
+
+if not any(facts):
+    print("\n>> Flags were found but no factor fired on any row.")
+    print("   Either this slice genuinely has no defects, or every row is "
+          "marked expected_behavior. The values above tell you which.")
 
 audit["factors"] = ["; ".join(f) for f in facts]
 audit["factor_drivers"] = [
