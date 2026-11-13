@@ -6,12 +6,14 @@
 #
 # Self-contained. No LLM calls. No imports beyond dataiku/pandas.
 # -------------------------------------------------------------------------
+import ast
 import json
 import math
 import re
 import textwrap
 
 import dataiku
+import numpy as np
 import pandas as pd
 from dataiku import spark as dkuspark
 from pyspark.sql import SQLContext
@@ -203,6 +205,11 @@ _STOPW = {
 }
 
 # Flags whose evidence points at chunk text worth locating
+# Chunk fields shown above a located hit. Everything else is body text,
+# which the matched extract already covers.
+SHOW_META = {"file name", "document title", "geography scope", "section",
+             "effective date", "version", "owner", "applicability"}
+
 CHUNK_FLAGS = {"ANSWER_CONTRADICTS_CHUNKS", "ANSWER_MISREADS_TABLE",
                "ANSWER_HAS_UNSUPPORTED_CLAIM",
                "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
@@ -228,27 +235,91 @@ def _sentences(text):
     return out
 
 
-def parse_chunks(raw):
+# **Key:**value  — the colon sits INSIDE the asterisks, and a value runs
+# until the next key marker or the end of the chunk. So values may span
+# lines and contain commas, colons and pipe tables.
+KV_RE = re.compile(r"\*\*\s*([^*:\n]{1,80}?)\s*:\s*\*\*")
+
+# Chunks are separated by commas, but values contain commas too, so a
+# naive split corrupts them. Split on the repeated LEADING key instead —
+# that marker only ever starts a chunk. Set this if auto-detection picks
+# the wrong key.
+CHUNK_SPLIT_KEY = None      # e.g. "File Name"
+
+
+def parse_chunk_text(text):
+    """One chunk -> ordered [(key, value)]."""
+    text = str(text)
+    out, last_key, last_end = [], None, 0
+    for m in KV_RE.finditer(text):
+        seg = text[last_end:m.start()].strip()
+        if last_key is not None:
+            out.append((last_key, seg))
+        elif seg:
+            out.append(("(preamble)", seg))
+        last_key, last_end = m.group(1).strip(), m.end()
+    tail = text[last_end:].strip()
+    if last_key is not None:
+        out.append((last_key, tail))
+    elif tail:
+        out.append(("(body)", tail))
+    return out
+
+
+def split_chunks(raw, split_key=None):
+    """document_chunks -> list of chunk strings."""
     if raw is None or str(raw).strip() in ("", "[]", "null", "None", "nan"):
         return []
-    try:
-        obj = json.loads(raw)
-    except (TypeError, ValueError):
-        return [{"doc_title": "?", "text": str(raw)}]
-    if not isinstance(obj, list):
-        obj = [obj]
+    s = str(raw).strip()
+
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            v = loader(s)
+            if isinstance(v, list):
+                return [x if isinstance(x, str) else json.dumps(x) for x in v]
+            if isinstance(v, (str, dict)):
+                return [v if isinstance(v, str) else json.dumps(v)]
+        except Exception:
+            pass
+
+    key = split_key or CHUNK_SPLIT_KEY
+    if not key:
+        m = KV_RE.search(s)
+        key = m.group(1).strip() if m else None
+    if not key:
+        return [s]
+
+    marker = re.compile(r"\*\*\s*" + re.escape(key) + r"\s*:\s*\*\*")
+    starts = [m.start() for m in marker.finditer(s)]
+    if len(starts) <= 1:
+        return [s]
+    bounds = starts + [len(s)]
     out = []
-    for item in obj:
-        if isinstance(item, dict):
-            out.append({"doc_title": str(item.get("doc_title")
-                                         or item.get("title") or "?"),
-                        "text": str(item.get("text")
-                                    or item.get("content") or "")})
-        else:
-            txt = str(item)
-            m = re.search(r"\*{0,2}Document Title:?\*{0,2}\s*(.+)", txt)
-            title = re.sub(r"\*+", "", m.group(1)).strip() if m else "?"
-            out.append({"doc_title": title, "text": txt})
+    for a, b in zip(bounds, bounds[1:]):
+        piece = s[a:b].strip().rstrip(",").strip()
+        if piece:
+            out.append(piece)
+    return out
+
+
+def parse_chunks(raw):
+    """document_chunks -> [{doc_title, kv, text}], one entry per chunk."""
+    out = []
+    for text in split_chunks(raw):
+        kv = parse_chunk_text(text)
+        d  = {k.lower(): v for k, v in kv}
+        title = (next((v for k, v in d.items() if "document title" in k), None)
+                 or next((v for k, v in d.items() if "file name" in k), None)
+                 or "?")
+        # Search the parsed VALUES, not the raw text: otherwise the
+        # **Key:** markers end up inside the matched extract, and with no
+        # newlines between pairs the whole chunk reads as one sentence.
+        sents = []
+        for k, v in kv:
+            for sent in _sentences(v):
+                sents.append((k, sent))
+        out.append({"doc_title": re.sub(r"\*+", "", str(title)).strip()[:80],
+                    "kv": kv, "text": text, "sentences": sents})
     return out
 
 
@@ -277,11 +348,13 @@ def locate(quote, chunks, context=1, top=2):
     if not qt or not chunks:
         return []
 
-    sent_lists = [_sentences(c["text"]) for c in chunks]
+    sent_lists = [c.get("sentences") or [("", x) for x in
+                                          _sentences(c["text"])]
+                  for c in chunks]
     # document frequency across sentences, for rare-term weighting
     dfreq, nsent = {}, sum(len(x) for x in sent_lists) or 1
     for sl in sent_lists:
-        for sent in sl:
+        for _, sent in sl:
             for t in _toks(sent):
                 dfreq[t] = dfreq.get(t, 0) + 1
     weight = {t: math.log(1 + nsent / (1 + dfreq.get(t, 0))) for t in qt}
@@ -290,7 +363,7 @@ def locate(quote, chunks, context=1, top=2):
 
     hits = []
     for ci, sents in enumerate(sent_lists):
-        for si, sent in enumerate(sents):
+        for si, (field, sent) in enumerate(sents):
             shared = qt & _toks(sent)
             if not shared:
                 continue
@@ -298,12 +371,20 @@ def locate(quote, chunks, context=1, top=2):
             # numbers are high-precision anchors
             if qnums and qnums & set(_NUM.findall(sent)):
                 score = min(1.0, score + 0.25)
-            lo, hi = max(0, si - context), min(len(sents), si + context + 1)
+            # keep the context window inside the SAME field, or a hit in
+            # Content picks up the tail of Geography Scope
+            lo, hi = si, si + 1
+            while lo > 0 and si - lo < context and sents[lo - 1][0] == field:
+                lo -= 1
+            while (hi < len(sents) and hi - si <= context
+                   and sents[hi][0] == field):
+                hi += 1
             hits.append({"chunk": ci + 1,
                          "doc_title": chunks[ci]["doc_title"],
+                         "field": field,
                          "score": round(min(score, 1.0), 2),
                          "sentence": sent,
-                         "context": " ".join(sents[lo:hi])})
+                         "context": " ".join(x for _, x in sents[lo:hi])})
     hits.sort(key=lambda h: -h["score"])
     return hits[:top]
 
@@ -552,15 +633,22 @@ def show(factor, n=5, strong_only=True, locate_chunks=True):
             if chunks and fl in CHUNK_FLAGS and cside:
                 hits = locate(cside, chunks)
                 if not hits or hits[0]["score"] < 0.3:
-                    print("    >> NOT FOUND in the chunks. The quote was "
+                    print("    >> NOT FOUND in any chunk. The quote was "
                           "paraphrased or invented — treat as unverified.")
                 else:
-                    h = hits[0]
+                    h   = hits[0]
+                    ci  = h["chunk"] - 1
                     tag = "" if h["score"] >= 0.8 else "  (partial match)"
-                    print(f"    FOUND chunk [{h['chunk']}] "
-                          f"{h['doc_title']}  match {h['score']}{tag}")
-                    for line in textwrap.wrap(h["context"], 88):
-                        print(f"       {line}")
+                    print(f"    FOUND in chunk [{h['chunk']}] of "
+                          f"{len(chunks)}   match {h['score']}{tag}")
+                    # ONLY this chunk's fields — never another chunk's
+                    for k, v in chunks[ci]["kv"]:
+                        if k.lower() in SHOW_META:
+                            print(f"      {k}: {str(v)[:90]}")
+                    fld = h.get("field") or "content"
+                    print(f"      matched in field '{fld}':")
+                    for line in textwrap.wrap(h["context"], 84):
+                        print(f"        {line}")
 
 
 for fa in FACTORS:
@@ -664,207 +752,331 @@ else:
 
 
 # ---- 6. CHARTS (preview of the Tableau build) ---------------------------
-# Same six views you would build in Tableau. Render inline in the Dataiku
-# notebook, or set CHARTS_HTML to save one shareable file.
-CHARTS_HTML = None          # e.g. "/tmp/audit_charts.html"
+# matplotlib, not plotly: static images need no JavaScript, no CDN and no
+# nbformat. A blocked CDN is the usual reason plotly renders blank inside a
+# corporate network.
+#
+# Palette is the validated categorical set (worst adjacent CVD dE 9.1,
+# normal-vision dE 19.6). Its mid-lightness hues sit under 3:1 against the
+# surface, so every bar carries a direct value label.
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 
-# How to render inline.
-#   "html" - IPython.display.HTML. Works WITHOUT nbformat. Default.
-#   "show" - plotly fig.show(). Needs nbformat >= 4.2.0 installed.
-#   "none" - render nothing inline; use CHARTS_HTML to save a file instead.
-CHART_RENDER = "html"
+CHART_DIR = None      # e.g. "/tmp/audit_charts" to also save PNGs
+CHART_DPI = 110
 
-PALETTE = {"strong": "#1f6f4a", "weak": "#c9a227",
-           "expected": "#2f7d55", "defect": "#b8562f",
-           "review": "#b8562f", "sample": "#4a7ba7", "cleared": "#8aa79b"}
+# categorical: fixed order, never cycled
+CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+       "#e87ba4", "#008300", "#6250d6", "#e34948"]
+INK      = "#0b0b0b"      # primary text
+INK_SOFT = "#52514e"      # secondary text
+GRID     = "#e4e3df"
+SURFACE  = "#fcfcfb"
+OK_C     = "#1baf7a"      # status: expected / good
+BAD_C    = "#e34948"      # status: defect
+SEQ = LinearSegmentedColormap.from_list("seq", ["#eef4fc", "#2a78d6"])
+
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE,
+    "axes.edgecolor": GRID, "axes.labelcolor": INK_SOFT,
+    "text.color": INK, "xtick.color": INK_SOFT, "ytick.color": INK_SOFT,
+    "font.size": 10, "axes.titlesize": 12, "axes.titleweight": "bold",
+    "axes.titlelocation": "left", "axes.titlepad": 14,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "figure.autolayout": False,
+})
 
 
-def _render(figs):
-    """Render inline without requiring nbformat.
+def _finish(fig, ax, name, xlabel=None, grid_axis="x", grid=True):
+    """Recessive grid, soft spines, save, show.
 
-    fig.show() goes through plotly's mime-type renderer, which raises
-    "mime type rendering requires nbformat>=4.2.0" when that package is
-    absent. Handing the HTML straight to IPython skips that path.
+    grid=False for heatmaps: a grid drawn over image cells reads as
+    hairlines through the data.
     """
-    if CHART_RENDER == "show":
-        for _, fig in figs:
-            fig.show()
-        return
-    try:
-        from IPython.display import HTML, display
-    except ImportError:
-        print("no IPython available - set CHARTS_HTML to save a file instead")
-        return
-    for i, (name, fig) in enumerate(figs):
-        # load plotly.js once, from CDN, on the first chart only
-        html = fig.to_html(full_html=False,
-                           include_plotlyjs="cdn" if i == 0 else False)
-        display(HTML(html))
+    if grid:
+        ax.grid(axis=grid_axis, color=GRID, linewidth=0.8, zorder=0)
+    else:
+        ax.grid(False)
+    ax.set_axisbelow(True)
+    ax.spines["left"].set_color(GRID)
+    ax.spines["bottom"].set_color(GRID)
+    if xlabel:
+        ax.set_xlabel(xlabel, color=INK_SOFT)
+    fig.tight_layout()
+    if CHART_DIR:
+        import os
+        os.makedirs(CHART_DIR, exist_ok=True)
+        fig.savefig(f"{CHART_DIR}/{name}.png", dpi=CHART_DPI,
+                    facecolor=SURFACE, bbox_inches="tight")
+    plt.show()
 
 
-def build_charts(show=True, html_path=None):
-    try:
-        import plotly.express as px
-    except ImportError:
-        print("\nplotly not installed - skipping charts.")
-        print("  pip install plotly")
-        print("  (px.bar and px.imshow are all this uses; both ship with "
-              "the base plotly package)")
-        return []
+def _label_barh(ax, bars, values, fmt="{:,.0f}"):
+    """Direct value labels. Obligatory: these hues fall under 3:1."""
+    for b, v in zip(bars, values):
+        if v <= 0:
+            continue
+        ax.text(b.get_width() + max(values) * 0.015,
+                b.get_y() + b.get_height() / 2, fmt.format(v),
+                va="center", ha="left", fontsize=9, color=INK)
 
-    figs = []
-    nfull = max(len(audit_full), 1)
 
-    # --- 1. Triage split: how much was EXPECTED ---------------------
-    def _count(col):
-        if col not in audit_full.columns:
-            return 0
-        return int(audit_full[col].map(_val).eq(TRUE).sum())
-
-    n_exp    = _count("expected_behavior")
-    n_rev    = _count("needs_review")
-    n_samp   = _count("in_sample_queue")
-    n_other  = max(nfull - n_exp - n_rev - n_samp, 0)
-
-    split = pd.DataFrame([
-        ("Expected behaviour", n_exp,   "expected"),
-        ("Flagged for review", n_rev,   "review"),
-        ("Control sample",     n_samp,  "sample"),
-        ("Cleared, unsampled", n_other, "cleared"),
-    ], columns=["Outcome", "Interactions", "key"])
-    split["Share"] = (100 * split["Interactions"] / nfull).round(1)
-
-    f1 = px.bar(split, x="Interactions", y="Outcome", orientation="h",
-                text=split.apply(
-                    lambda r: f"{r['Interactions']}  ({r['Share']}%)", axis=1),
-                color="key", color_discrete_map=PALETTE,
-                title=f"Triage split - {nfull} interactions "
-                      f"({100 * n_exp / nfull:.0f}% expected behaviour)")
-    f1.update_layout(showlegend=False, yaxis_title="", height=320)
-    figs.append(("triage_split", f1))
-
-    # --- 2. Route x expected vs defect ------------------------------
-    rc = _col("route") or "route"
-    ec = _col("expected_behavior")
-    if rc in audit_full.columns and ec:
-        rx = audit_full.copy()
-        rx["Outcome"] = rx[ec].map(
-            lambda v: "expected" if _val(v) == TRUE else "defect")
-        g = (rx.groupby([rc, "Outcome"]).size()
-               .reset_index(name="Interactions"))
-        f2 = px.bar(g, x="Interactions", y=rc, color="Outcome",
-                    orientation="h", barmode="stack",
-                    color_discrete_map=PALETTE,
-                    title="Where the agent is reliable, by route")
-        f2.update_layout(yaxis_title="", height=320)
-        figs.append(("route_outcome", f2))
-
-    # --- 3. Factor x driver, coloured by evidence strength ----------
-    drv = []
+def _driver_frame():
+    out = []
     for r, f in zip(rows, facts):
         for factor, flags in f.items():
             for fl in flags:
-                drv.append({"Factor": factor, "Driver": fl,
+                out.append({"Factor": factor, "Driver": fl,
                             "Strength": "strong" if fl in STRONG else "weak",
-                            "transaction_id": r.get("transaction_id")})
-    if drv:
-        dd = pd.DataFrame(drv)
-        g = (dd.groupby(["Factor", "Driver", "Strength"])["transaction_id"]
-               .nunique().reset_index(name="Interactions"))
-        f3 = px.bar(g, x="Interactions", y="Factor", color="Driver",
-                    orientation="h", barmode="stack", text="Interactions",
-                    title="What drove each factor")
-        f3.update_layout(yaxis_title="", height=420)
-        figs.append(("factor_driver", f3))
+                            "tid": r.get("transaction_id")})
+    return pd.DataFrame(out)
 
-        # --- 4. Evidence strength per factor ------------------------
-        g2 = (dd.groupby(["Factor", "Strength"])["transaction_id"]
-                .nunique().reset_index(name="Interactions"))
-        f4 = px.bar(g2, x="Interactions", y="Factor", color="Strength",
-                    orientation="h", barmode="stack", text="Interactions",
-                    color_discrete_map=PALETTE,
-                    title="Evidence strength - what can be defended "
-                          "in review")
-        f4.update_layout(yaxis_title="", height=360)
-        figs.append(("evidence_strength", f4))
 
-    # --- 5. Factor x cause heatmap ----------------------------------
+def build_charts():
+    nfull = max(len(audit_full), 1)
+
+    def cnt(col):
+        c = _col(col)
+        return int(audit_full[c].map(_val).eq(TRUE).sum()) if c else 0
+
+    n_exp, n_rev, n_samp = (cnt("expected_behavior"), cnt("needs_review"),
+                            cnt("in_sample_queue"))
+    n_rest = max(nfull - n_exp - n_rev - n_samp, 0)
+
+    # --- 1. Headline: how much was expected -------------------------
+    fig, ax = plt.subplots(figsize=(9, 1.6))
+    ax.axis("off")
+    ax.text(0, .72, f"{100 * n_exp / nfull:.0f}%", fontsize=46,
+            fontweight="bold", color=OK_C, va="center")
+    ax.text(.22, .80, "of interactions were confirmed expected behaviour",
+            fontsize=13, color=INK, va="center")
+    ax.text(.22, .46, f"{nfull:,} audited   ·   {n_rev:,} flagged for review "
+                      f"({100 * n_rev / nfull:.0f}%)   ·   {n_samp:,} control "
+                      f"sample", fontsize=11, color=INK_SOFT, va="center")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    _finish(fig, ax, "01_headline", grid_axis="y")
+
+    # --- 2. Triage split --------------------------------------------
+    lab = ["Expected behaviour", "Flagged for review",
+           "Control sample", "Cleared, unsampled"]
+    val = [n_exp, n_rev, n_samp, n_rest]
+    col = [OK_C, BAD_C, CAT[0], "#b9b8b2"]
+    fig, ax = plt.subplots(figsize=(9, 3.1))
+    bars = ax.barh(lab, val, color=col, height=.62, zorder=3)
+    _label_barh(ax, bars, val)
+    for b, v in zip(bars, val):
+        ax.text(b.get_width() * 0.5, b.get_y() + b.get_height() / 2,
+                f"{100 * v / nfull:.0f}%", va="center", ha="center",
+                fontsize=9, color="white", fontweight="bold") if v / nfull > .08 else None
+    ax.invert_yaxis()
+    ax.set_title(f"Triage split — {nfull:,} interactions")
+    _finish(fig, ax, "02_triage", "interactions")
+
+    # --- 3. Route x expected vs defect -------------------------------
+    rc, ec = _col("route") or "route", _col("expected_behavior")
+    if rc in audit_full.columns and ec:
+        t = audit_full.copy()
+        t["ok"] = t[ec].map(lambda v: _val(v) == TRUE)
+        g = t.groupby(rc)["ok"].agg(["sum", "count"])
+        g["defect"] = g["count"] - g["sum"]
+        g = g.sort_values("count")
+        fig, ax = plt.subplots(figsize=(9, max(3.2, .62 * len(g) + 2.1)))
+        b1 = ax.barh(g.index, g["sum"], color=OK_C, height=.6,
+                     label="expected", zorder=3,
+                     edgecolor=SURFACE, linewidth=1.6)
+        b2 = ax.barh(g.index, g["defect"], left=g["sum"], color=BAD_C,
+                     height=.6, label="defect", zorder=3,
+                     edgecolor=SURFACE, linewidth=1.6)
+        for y, (s, c) in enumerate(zip(g["sum"], g["count"])):
+            ax.text(c + c * .02, y, f"{100 * s / c:.0f}% ok",
+                    va="center", fontsize=9, color=INK)
+        ax.legend(frameon=False, ncol=2, loc="upper center",
+                  bbox_to_anchor=(.5, -.22), fontsize=9)
+        ax.set_title("Where the agent is reliable, by route")
+        _finish(fig, ax, "03_route", "interactions")
+
+    dd = _driver_frame()
+
+    # --- 4. Factor counts -------------------------------------------
+    fc = [(fa, int(audit[f"is_{fa}"].sum())) for fa in FACTORS
+          if f"is_{fa}" in audit.columns]
+    if fc:
+        fc.sort(key=lambda x: x[1])
+        fig, ax = plt.subplots(figsize=(9, 3.4))
+        bars = ax.barh([a for a, _ in fc], [b for _, b in fc],
+                       color=CAT[0], height=.6, zorder=3)
+        _label_barh(ax, bars, [b for _, b in fc])
+        ax.set_title(f"What the user experienced  "
+                     f"(of {len(audit):,} analysed)")
+        _finish(fig, ax, "04_factors", "interactions")
+
+    # --- 5. Factor x driver -----------------------------------------
+    if len(dd):
+        piv = (dd.groupby(["Factor", "Driver"])["tid"].nunique()
+                 .unstack(fill_value=0))
+        piv = piv.loc[piv.sum(axis=1).sort_values().index]
+        fig, ax = plt.subplots(figsize=(10, max(3, .66 * len(piv) + 1.8)))
+        left = np.zeros(len(piv))
+        for i, drv in enumerate(piv.columns):
+            v = piv[drv].values
+            ax.barh(piv.index, v, left=left, height=.6,
+                    color=CAT[i % len(CAT)], label=drv, zorder=3,
+                    edgecolor=SURFACE, linewidth=1.6)
+            for y, (x0, x1) in enumerate(zip(left, v)):
+                if x1 > 0:
+                    ax.text(x0 + x1 / 2, y, f"{int(x1)}", va="center",
+                            ha="center", fontsize=8, color="white",
+                            fontweight="bold")
+            left += v
+        ax.legend(frameon=False, fontsize=8, ncol=2,
+                  loc="upper left", bbox_to_anchor=(1.01, 1))
+        ax.set_title("What drove each factor")
+        _finish(fig, ax, "05_factor_driver", "interactions")
+
+        # --- 6. Evidence strength ----------------------------------
+        sp = (dd.groupby(["Factor", "Strength"])["tid"].nunique()
+                .unstack(fill_value=0))
+        for c in ("strong", "weak"):
+            if c not in sp.columns:
+                sp[c] = 0
+        sp = sp.loc[sp.sum(axis=1).sort_values().index]
+        fig, ax = plt.subplots(figsize=(9, max(3.4, .62 * len(sp) + 2.2)))
+        ax.barh(sp.index, sp["strong"], color="#1d5fa8", height=.6,
+                label="strong — defensible in review", zorder=3,
+                edgecolor=SURFACE, linewidth=1.6)
+        ax.barh(sp.index, sp["weak"], left=sp["strong"], color="#9dc3ec",
+                height=.6, label="weak — sample only", zorder=3,
+                edgecolor=SURFACE, linewidth=1.6)
+        for y, (s, w) in enumerate(zip(sp["strong"], sp["weak"])):
+            if s: ax.text(s / 2, y, int(s), va="center", ha="center",
+                          fontsize=8, color="white", fontweight="bold")
+            if w: ax.text(s + w / 2, y, int(w), va="center", ha="center",
+                          fontsize=8, color=INK)
+        ax.legend(frameon=False, ncol=2, loc="upper center",
+                  bbox_to_anchor=(.5, -.20), fontsize=9)
+        ax.set_title("Evidence strength by factor")
+        _finish(fig, ax, "06_strength", "interactions")
+
+        # --- 7. Factor co-occurrence -------------------------------
+        fl = [fa for fa in FACTORS if f"is_{fa}" in audit.columns]
+        if len(fl) > 1:
+            m = np.zeros((len(fl), len(fl)), int)
+            for _, r in audit.iterrows():
+                on = [i for i, fa in enumerate(fl) if r.get(f"is_{fa}")]
+                for i in on:
+                    for j in on:
+                        m[i, j] += 1
+            if m.sum():
+                fig, ax = plt.subplots(figsize=(6.4, 5.4))
+                im = ax.imshow(m, cmap=SEQ)
+                ax.set_xticks(range(len(fl)), fl, rotation=35, ha="right")
+                ax.set_yticks(range(len(fl)), fl)
+                hi = m.max() or 1
+                for i in range(len(fl)):
+                    for j in range(len(fl)):
+                        if m[i, j]:
+                            ax.text(j, i, m[i, j], ha="center", va="center",
+                                    fontsize=9,
+                                    color="white" if m[i, j] > hi * .55 else INK)
+                ax.set_title("Which factors occur together\n(diagonal = total)")
+                fig.colorbar(im, ax=ax, shrink=.75, label="interactions")
+                _finish(fig, ax, "07_cooccurrence", grid=False)
+
+    # --- 8. Factor x cause heatmap -----------------------------------
     cc = _col("all_causes") or _col("cause")
-    if drv and cc:
-        pairs = []
+    if len(dd) and cc:
+        pr = []
         for r, f in zip(rows, facts):
-            causes = [c.strip() for c in str(r.get(cc) or "").split(";")
-                      if c.strip()] or ["(none assigned)"]
-            for factor in f:
-                for c in causes:
-                    pairs.append({"Factor": factor, "Cause": c})
-        if pairs:
-            pv = pd.crosstab(pd.DataFrame(pairs)["Factor"],
-                             pd.DataFrame(pairs)["Cause"])
-            f5 = px.imshow(pv, text_auto=True, aspect="auto",
-                           color_continuous_scale="Teal",
-                           title="Factor x root cause")
-            f5.update_layout(height=380)
-            figs.append(("factor_cause", f5))
+            cs = [c.strip() for c in str(r.get(cc) or "").split(";")
+                  if c.strip()] or ["(none assigned)"]
+            for fa in f:
+                for c in cs:
+                    pr.append({"Factor": fa, "Cause": c})
+        if pr:
+            pv = pd.crosstab(pd.DataFrame(pr)["Factor"],
+                             pd.DataFrame(pr)["Cause"])
+            fig, ax = plt.subplots(
+                figsize=(max(7, 1.5 + 1.25 * pv.shape[1]),
+                         max(3, 1.4 + .62 * pv.shape[0])))
+            im = ax.imshow(pv.values, cmap=SEQ, aspect="auto")
+            ax.set_xticks(range(pv.shape[1]),
+                          [c.replace("_", " ") for c in pv.columns],
+                          rotation=32, ha="right", fontsize=9)
+            ax.set_yticks(range(pv.shape[0]), pv.index, fontsize=9)
+            hi = pv.values.max() or 1
+            for i in range(pv.shape[0]):
+                for j in range(pv.shape[1]):
+                    v = pv.values[i, j]
+                    if v:
+                        ax.text(j, i, v, ha="center", va="center", fontsize=9,
+                                color="white" if v > hi * .55 else INK)
+            ax.set_title("Factor × root cause")
+            ax.grid(False)
+            fig.tight_layout()
+            if CHART_DIR:
+                import os
+                os.makedirs(CHART_DIR, exist_ok=True)
+                fig.savefig(f"{CHART_DIR}/08_factor_cause.png", dpi=CHART_DPI,
+                            facecolor=SURFACE, bbox_inches="tight")
+            plt.show()
 
-    # --- 6. Owner workload ------------------------------------------
+    # --- 9. Owner workload -------------------------------------------
     oc = _col("cause_owners") or _col("cause_owner")
     if oc and oc in audit.columns:
-        own = []
+        ow = {}
         for r in rows:
             for o in {x.strip() for x in str(r.get(oc) or "").split(";")
                       if x.strip()}:
-                own.append({"Owner": o,
-                            "transaction_id": r.get("transaction_id")})
-        if own:
-            g3 = (pd.DataFrame(own).groupby("Owner")["transaction_id"]
-                    .nunique().reset_index(name="Interactions")
-                    .sort_values("Interactions"))
-            f6 = px.bar(g3, x="Interactions", y="Owner", orientation="h",
-                        text="Interactions",
-                        title="Who fixes what")
-            f6.update_layout(yaxis_title="", height=340)
-            figs.append(("owner_workload", f6))
+                ow[o] = ow.get(o, 0) + 1
+        if ow:
+            k = sorted(ow, key=ow.get)
+            fig, ax = plt.subplots(figsize=(9, max(2.6, .55 * len(k) + 1.4)))
+            bars = ax.barh(k, [ow[x] for x in k], color=CAT[6],
+                           height=.6, zorder=3)
+            _label_barh(ax, bars, [ow[x] for x in k])
+            ax.set_title("Who fixes what")
+            _finish(fig, ax, "09_owners", "interactions")
 
-    # --- 7. Weekly volume: BARS, not lines --------------------------
-    # At this volume a line implies a trend that is not distinguishable
-    # from noise. Bars with counts on them are the honest form.
-    if DATE_COL in audit.columns and drv:
+    # --- 10. Weekly: bars, never a line ------------------------------
+    # At this volume a trend line implies a signal that is not
+    # distinguishable from noise. Bars with counts are the honest form.
+    if DATE_COL in audit.columns and len(dd):
         w = audit.copy()
         w["_ts"] = pd.to_datetime(w[DATE_COL], errors="coerce")
         w = w[w["_ts"].notna()]
         if len(w):
             w["week"] = w["_ts"].dt.to_period("W-SUN").dt.start_time.dt.date
-            wk = []
-            for fa in FACTORS:
-                if f"is_{fa}" in w.columns:
-                    for week, n in w[w[f"is_{fa}"]].groupby("week").size().items():
-                        wk.append({"Week": str(week), "Factor": fa,
-                                   "Interactions": int(n)})
-            if wk:
-                f7 = px.bar(pd.DataFrame(wk), x="Week", y="Interactions",
-                            color="Factor", barmode="group", text="Interactions",
-                            title="Weekly counts (bars, not a line - at this "
-                                  "volume a trend line would mislead)")
-                f7.update_layout(height=360)
-                figs.append(("weekly", f7))
-
-    if show and CHART_RENDER != "none":
-        _render(figs)
-    if html_path:
-        with open(html_path, "w") as fh:
-            fh.write("<html><body style='font-family:sans-serif'>")
-            for name, fig in figs:
-                fh.write(fig.to_html(full_html=False,
-                                     include_plotlyjs="cdn"))
-            fh.write("</body></html>")
-        print(f"\ncharts written to {html_path}")
-    return figs
-
-
-_figs = build_charts(show=True, html_path=CHARTS_HTML)
+            wks = sorted(w["week"].unique())
+            act = [fa for fa in FACTORS
+                   if f"is_{fa}" in w.columns and w[f"is_{fa}"].any()]
+            if wks and act:
+                fig, ax = plt.subplots(figsize=(max(8, 1.4 * len(wks) + 3), 4.3))
+                bw = .8 / len(act)
+                xs = np.arange(len(wks))
+                for i, fa in enumerate(act):
+                    v = [int(w[(w["week"] == wk) & w[f"is_{fa}"]].shape[0])
+                         for wk in wks]
+                    ax.bar(xs + i * bw - .4 + bw / 2, v, bw * .88,
+                           color=CAT[i % len(CAT)], label=fa, zorder=3)
+                    for x, y in zip(xs + i * bw - .4 + bw / 2, v):
+                        if y:
+                            ax.text(x, y + .1, y, ha="center", fontsize=8,
+                                    color=INK)
+                vol = [int((w["week"] == wk).sum()) for wk in wks]
+                ax.set_xticks(xs, [f"{wk}\n(n={n})" for wk, n in zip(wks, vol)],
+                              fontsize=8)
+                ax.legend(frameon=False, ncol=min(len(act), 5), fontsize=9,
+                          loc="upper center", bbox_to_anchor=(.5, -.16))
+                ax.set_title("Weekly counts — bars, not a line: at this "
+                             "volume a trend line would mislead")
+                _finish(fig, ax, "10_weekly", grid_axis="y")
 
 
+try:
+    build_charts()
+except Exception as _e:
+    print(f"\ncharts skipped: {type(_e).__name__}: {_e}")
 # ---- 7. TABLEAU EXTRACTS ------------------------------------------------
 # quality_factors / all_causes are multi-value strings, which Tableau
 # cannot count. Build a LONG table: one row per (interaction, factor,
