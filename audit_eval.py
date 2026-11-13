@@ -190,6 +190,11 @@ ANSWER_ONLY = [
     "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_OMITS_CONDITION_OR_EXCEPTION",
     "ANSWERED_WITH_SILENT_ASSUMPTION", "ANSWER_NUMBERS_UNSUPPORTED",
     "ANSWER_ACKNOWLEDGES_LIMITATION",
+    # Was missing: on a clarified row the judge was handed a clarifying
+    # question as "the answer" and asked whether it covered all parts.
+    # A question covers nothing, so it returned FALSE and the row was
+    # tagged Incomplete.
+    "ANSWER_COVERS_ALL_PARTS",
 ]
 BEHAVIOR_APPLIES = {
     "CLARIFICATION_UNNECESSARY": ("clarified",),
