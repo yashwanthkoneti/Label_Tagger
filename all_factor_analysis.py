@@ -844,27 +844,37 @@ def build_charts():
     m_rev, m_samp = mask("needs_review"), mask("in_sample_queue")
     m_exp = mask("expected_behavior")
 
-    # expected_behavior may be blank or absent after a round-trip through
-    # the store. Without the fallback every row falls into the leftover
-    # bucket and the headline reads 0% expected, which is not a finding.
+    # expected_behavior may arrive blank after a round-trip through the
+    # store. The pipeline sets themes = [] whenever a row is expected, so
+    # a BLANK THEME is the surviving signal — not "wasn't flagged".
+    # The two differ: a themed row that stayed below the review bar is
+    # not expected behaviour, it is an unraised defect.
     exp_derived = not m_exp.any()
     if exp_derived:
         ec = _col("expected_behavior")
         vals = (dict(audit_full[ec].map(_val).value_counts()) if ec
                 else "column absent")
+        tc = _col("primary_theme") or _col("themes")
+        if tc:
+            no_theme = (audit_full[tc].isna()
+                        | audit_full[tc].astype(str).str.strip()
+                          .isin(["", "nan", "None"]))
+        else:
+            no_theme = pd.Series(True, index=audit_full.index)
+        m_exp = no_theme & ~m_rev
         print(f"\nnote: expected_behavior carries no TRUE values ({vals}).")
-        print("      Falling back to 'not flagged for review' as the "
-              "cleared set. The chart says 'derived' where this applies.")
-        # anything not raised and not sampled is cleared
-        m_exp = ~m_rev & ~m_samp
+        print(f"      Deriving it from a blank theme + not flagged, which "
+              f"is how the pipeline writes an expected row.")
+        print(f"      derived cleared: {int(m_exp.sum())} of {nfull}")
 
-    n_exp  = int(m_exp.sum())
+    # four mutually exclusive buckets that sum to the total
     n_rev  = int(m_rev.sum())
     n_samp = int((m_samp & ~m_rev).sum())
+    n_exp  = int((m_exp & ~m_rev & ~m_samp).sum())
     n_rest = max(nfull - n_exp - n_rev - n_samp, 0)
 
-    exp_word = ("cleared — no defect raised (derived)" if exp_derived
-                else "confirmed expected behaviour")
+    exp_word = ("expected behaviour (derived from a blank theme)"
+                if exp_derived else "confirmed expected behaviour")
 
     # --- 1. Headline: how much was expected -------------------------
     fig, ax = plt.subplots(figsize=(9, 1.6))
@@ -880,11 +890,13 @@ def build_charts():
     _finish(fig, ax, "01_headline", grid_axis="y")
 
     # --- 2. Triage split --------------------------------------------
-    lab = ["Cleared (derived)" if exp_derived else "Expected behaviour",
-           "Flagged for review", "Control sample", "Unclassified"]
+    lab = ["Expected behaviour" + (" (derived)" if exp_derived else ""),
+           "Flagged for review", "Control sample",
+           "Themed, below review bar"]
     val = [n_exp, n_rev, n_samp, n_rest]
-    col = [OK_C, BAD_C, CAT[0], "#b9b8b2"]
-    # drop an empty leftover bucket rather than drawing a zero bar
+    col = [OK_C, BAD_C, CAT[0], CAT[3]]
+    # the 4th bucket is a real finding when non-zero: a theme was assigned
+    # but nothing met the bar to raise it. Drawn only when it exists.
     keep = [i for i, v in enumerate(val) if v > 0 or i < 3]
     lab, val, col = ([lab[i] for i in keep], [val[i] for i in keep],
                      [col[i] for i in keep])
