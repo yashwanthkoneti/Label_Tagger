@@ -20,6 +20,7 @@
 # dbutils.library.restartPython()
 
 # COMMAND ----------
+import ast
 import hashlib
 import inspect
 import json
@@ -62,7 +63,13 @@ BATCH_SIZE      = 25    # rows per checkpoint write
 # not topic feel. Leave empty only if you have no index yet.
 # Path to a plain text file with one policy title per line.
 # With 303 documents this is cleaner than an inline list.
-CORPUS_INDEX_PATH = "/Volumes/main/policy_audit/data/corpus_index.txt"
+# Either a CSV with one row per document (file name / title / purpose /
+# scope — column names are auto-detected) or a plain text file of one title
+# per line. The CSV is much the better input: purpose and scope text makes
+# the similarity match work on what a document COVERS, not just what it is
+# called, and lets the judge rule on scope from a description rather than
+# from the feel of a title.
+CORPUS_INDEX_PATH = "/Volumes/main/policy_audit/data/corpus_index.csv"
 
 # How many top-matching corpus titles to send to the judge per request.
 # 15 keeps the prompt short while covering the most relevant candidates.
@@ -77,14 +84,80 @@ CORPUS_GAP_TOP_N = 5
 CORPUS_MATCH_THRESHOLD = 0.25
 
 def _load_corpus(path):
+    """Corpus index -> [{title, file_name, purpose, scope, display, match_text}].
+
+    Accepts a CSV with a column per field, or a plain text file of one title
+    per line. Purpose and scope matter twice over: they make the similarity
+    match far better than a title alone ("ETR" will never lexically match
+    "Environmental and Transition Risk Standard"), and they let the judge
+    decide scope from what a document actually covers instead of guessing
+    from its name.
+    """
+    def pack(title, file_name="", purpose="", scope=""):
+        title = str(title or file_name or "").strip()
+        bits = [x for x in (purpose, scope) if x]
+        return {
+            "title": title,
+            "file_name": str(file_name or "").strip(),
+            "purpose": str(purpose or "").strip(),
+            "scope": str(scope or "").strip(),
+            "display": title + (" — " + "; ".join(bits) if bits else ""),
+            # what the vectorizer sees; the title is repeated so it still
+            # dominates a long purpose paragraph
+            "match_text": " ".join([title, title, purpose, scope]).strip(),
+        }
+
     try:
+        if str(path).lower().endswith((".csv", ".tsv")):
+            sep = "\t" if str(path).lower().endswith(".tsv") else ","
+            df  = pd.read_csv(path, sep=sep, dtype=str).fillna("")
+            cols = {re.sub(r"[^a-z]", "", c.lower()): c for c in df.columns}
+
+            def find(*names):
+                for n in names:
+                    if n in cols:
+                        return cols[n]
+                for n in names:                      # substring fallback
+                    for k, c in cols.items():
+                        if n in k:
+                            return c
+                return None
+
+            c_title = find("documenttitle", "doctitle", "title", "documentname",
+                           "policyname", "name")
+            c_file  = find("filename", "file", "document", "source", "path")
+            c_purp  = find("purpose", "content", "description", "summary",
+                           "about", "objective", "intent", "body", "text")
+            c_scope = find("scope", "applicability", "appliesto", "coverage",
+                           "geography", "region")
+            if not (c_title or c_file):
+                raise ValueError(
+                    f"no title or file-name column found in {path}. "
+                    f"columns seen: {list(df.columns)}")
+            recs = [pack(r.get(c_title, "") if c_title else "",
+                         r.get(c_file, "")  if c_file  else "",
+                         r.get(c_purp, "")  if c_purp  else "",
+                         r.get(c_scope, "") if c_scope else "")
+                    for r in df.to_dict("records")]
+            recs = [r for r in recs if r["title"]]
+            print(f"loaded {len(recs)} corpus documents from {path}")
+            print(f"  title={c_title!r} file={c_file!r} "
+                  f"purpose={c_purp!r} scope={c_scope!r}")
+            n_desc = sum(1 for r in recs if r["purpose"] or r["scope"])
+            print(f"  {n_desc}/{len(recs)} carry a purpose or scope "
+                  f"description")
+            return recs
+
         with open(path) as fh:
-            titles = [l.strip() for l in fh if l.strip()]
-        print(f"loaded {len(titles)} corpus titles from {path}")
-        return titles
+            recs = [pack(l.strip()) for l in fh if l.strip()]
+        print(f"loaded {len(recs)} corpus titles from {path}")
+        return recs
     except FileNotFoundError:
         print(f"WARNING: corpus index not found at {path}. "
               f"Scope judgments will rely on topic feel only.")
+        return []
+    except Exception as exc:
+        print(f"WARNING: could not read corpus index {path}: {exc}")
         return []
 
 CORPUS_INDEX = _load_corpus(CORPUS_INDEX_PATH)
@@ -198,6 +271,7 @@ ANSWER_ONLY = [
 ]
 BEHAVIOR_APPLIES = {
     "CLARIFICATION_UNNECESSARY": ("clarified",),
+    "CLARIFY_QUESTION_DIVERTS":   ("clarified",),
     "CLARIFICATION_VAGUE":       ("clarified",),
     "REFUSAL_REASON_INACCURATE": REFUSED,
     "REFUSAL_LEAKS_SUBSTANCE":   REFUSED,
@@ -222,6 +296,7 @@ CAUSE_OWNER = {
     "clarified_though_chunks_resolved_it": "routing prompt",
     "clarified_on_stale_context":          "conversation memory",
     "clarified_though_request_was_clear":  "routing prompt",
+    "clarified_with_irrelevant_question":  "routing prompt",
     "prompt_or_routing":                   "prompt / routing",
     "generation_or_communication":         "response prompt",
     "acknowledged_limitation_correctly":   "corpus owners",
@@ -331,7 +406,7 @@ def _build_corpus_index(titles):
     global _corpus_vec, _corpus_matrix
     if not titles:
         return
-    docs = [norm(t) for t in titles]
+    docs = [norm(t["match_text"]) for t in titles]
     # char n-grams catch spelling/morphology, word n-grams catch topic words.
     # Union of both is more robust than either alone for short titles.
     _corpus_vec = FeatureUnion([
@@ -360,7 +435,7 @@ def top_corpus_titles(request_text, n=None):
     sim, order = _corpus_scores(request_text)
     if order is None or len(order) == 0:
         return CORPUS_INDEX[:n]
-    return [CORPUS_INDEX[i] for i in order[:n]]
+    return [CORPUS_INDEX[i] for i in order[:n]]   # records
 
 
 def find_missing_documents(request_text, retrieved_titles, n=None):
@@ -379,9 +454,13 @@ def find_missing_documents(request_text, retrieved_titles, n=None):
     for i in order:
         if len(out) >= n:
             break
-        title = CORPUS_INDEX[i]
-        if norm(title) not in retrieved_norm and sim[i] > 0.05:
-            out.append({"title": title,
+        rec = CORPUS_INDEX[i]
+        names = {norm(rec["title"]), norm(rec["file_name"])} - {""}
+        if not (names & retrieved_norm) and sim[i] > 0.05:
+            out.append({"title": rec["title"],
+                        "file_name": rec["file_name"],
+                        "purpose": rec["purpose"],
+                        "scope": rec["scope"],
                         "score": round(float(sim[i]), 3)})
     return out
 
@@ -529,12 +608,17 @@ CALLS = {
                 "TRUE: states a rule, condition, number or date that is not in the chunks.",
                 "FALSE: every factual statement is supported by the chunks."),
             "ANSWER_MISREADS_TABLE": (
-                "TRUE: a chunk contains a table (pipe-delimited rows) and the answer "
-                "pairs a value with the wrong row — wrong country, role, tier or "
-                "category. Evidence MUST quote the table row and the answer's claim as "
-                "'row: <row> || answer: <claim>'. Check each value against its OWN row.",
+                "TRUE: a chunk contains a TABLE and the answer pairs a value with the "
+                "wrong row — wrong country, region, role, tier or category. Tables are "
+                "given to you already split, one row per line, every cell written as "
+                "'<header>=<value>'. A value belongs ONLY to the row it is printed "
+                "under. To decide, take each figure the answer states, find the row it "
+                "names, and check that figure against THAT row's cells. Evidence MUST "
+                "quote the row and the answer's claim as 'row: <row> || answer: "
+                "<claim>'.",
                 "FALSE: no table in the chunks, or every value the answer cites sits in "
-                "the row it is attributed to. Also FALSE if the answer simply omits rows."),
+                "the row it is attributed to. Also FALSE if the answer simply omits "
+                "rows, or reports the table correctly but in prose."),
             "ANSWER_CONTRADICTS_CHUNKS": (
                 "TRUE only for a DIRECT factual contradiction a reader would spot "
                 "immediately: the chunk says X and the answer says not-X, or a different "
@@ -621,6 +705,16 @@ CALLS = {
             "Chunk lists five approval steps. Answer describes three of them. "
             "-> ANSWER_CONTRADICTS_CHUNKS=FALSE (incomplete, not contradictory).",
 
+            "TABLE: 'row 1: Region=EMEA; Threshold=USD 50,000' / "
+            "'row 2: Region=APAC; Threshold=USD 25,000'. "
+            "Answer: 'The APAC threshold is USD 50,000.' "
+            "-> ANSWER_MISREADS_TABLE=TRUE (evidence: 'row: Region=APAC; "
+            "Threshold=USD 25,000 || answer: APAC threshold is USD 50,000'). "
+            "The figure quoted belongs to the EMEA row.",
+
+            "Same table. Answer: 'EMEA is USD 50,000; APAC is USD 25,000.' "
+            "-> ANSWER_MISREADS_TABLE=FALSE. Every figure sits in its own row.",
+
             "Q: 'How many leave days do I get?' A: 'Employees receive 24 days annually.' "
             "-> both FALSE. Categorical rule, nothing assumed.",
         ],
@@ -629,8 +723,35 @@ CALLS = {
         "inputs": ["history", "request", "response"],
         "flags": {
             "CLARIFICATION_UNNECESSARY": (
-                "TRUE: asks for something the request or history already provides.",
-                "FALSE: the missing information was truly absent."),
+                "TRUE on EXACTLY TWO grounds, and no others:\n"
+                "  (a) ALREADY ANSWERED - the information the clarification "
+                "asks for is already stated in the CURRENT USER REQUEST or in "
+                "the CONVERSATION HISTORY. Evidence MUST quote the clarifying "
+                "question and the text that already supplies the answer, as "
+                "'asked: <question> || already given: <quote>'.\n"
+                "  (b) DIVERTS - the clarification asks about something that "
+                "does not bear on the request at all, so no answer to it "
+                "would change the policy answer. Evidence MUST quote the "
+                "request and the off-topic question as 'request: <quote> || "
+                "asked instead: <question>'.\n"
+                "The response asks SEVERAL questions. Set TRUE only if EVERY "
+                "question it asks falls under (a) or (b). If even one question "
+                "asks for something genuinely needed and not yet supplied, "
+                "the clarification was warranted.",
+                "FALSE: at least one of the questions asks for information "
+                "that is genuinely missing and genuinely needed. Also FALSE if "
+                "the request is ambiguous in a way the history does not "
+                "settle, if you cannot quote the text that supposedly already "
+                "answers it, or if the response is not a clarification at "
+                "all."),
+            "CLARIFY_QUESTION_DIVERTS": (
+                "TRUE: at least one clarifying question asks about a dimension "
+                "that would not change the policy answer either way - a "
+                "detail the policy does not turn on. Quote request and "
+                "question.",
+                "FALSE: every question asks about a dimension the answer "
+                "genuinely depends on (region, instrument, role, entity) - "
+                "even if that dimension was in fact already supplied."),
             "CLARIFICATION_VAGUE": (
                 "TRUE: the clarifying question does not say precisely what must be provided.",
                 "FALSE: it names exactly what is needed."),
@@ -698,131 +819,302 @@ def load(path):
     return df
 
 
-def _parse_chunk_item(item):
-    """Parse one chunk item.
+# **__KEY__:**value  — the colon sits INSIDE the asterisks, and keys arrive
+# decorated (__FILE_NAME__). A value runs until the next key marker or the
+# end of the chunk, so values may span lines and contain commas, colons and
+# pipe tables.
+KV_RE = re.compile(r"\*\*\s*([^*:\n]{1,80}?)\s*:\s*\*\*")
 
-    Each item is a string (or dict) whose lines follow this pattern:
-        **Key:** value        <- tracked field (key extracted from bold label before colon)
-        **Key:** value        <- bold markers stripped; colon is the splitter
-        bare text             <- no colon or no bold label -> goes into misc
+# Chunks are comma-separated, but values contain commas, so a naive split
+# corrupts them. Split on the repeated LEADING key instead.
+CHUNK_SPLIT_KEY = None      # e.g. "FILE_NAME"; None = auto-detect
 
-    Known keys (case-insensitive, normalised):
-        file_name / file name     -> doc_title
-        document_title / title    -> doc_title  (overrides file_name if present)
-        geography_scope / geo     -> geography
-        any other key: value      -> stored in extras dict
+# A markdown pipe row: |a|b|c|
+PIPE_ROW = re.compile(r"^\s*\|.*\|\s*$")
 
-    Everything that cannot be parsed with a colon (plain paragraphs, bold
-    text without a colon, continuation lines) is collected as misc_text
-    and appended to the final chunk text so the judge still sees it.
+
+def clean_key(k):
+    """__DOC_TITLE__ -> 'doc title'. Keys arrive wrapped in underscores and
+    joined by them; without this every lookup below silently misses and the
+    chunk loses its title."""
+    k = re.sub(r"\*+", "", str(k)).strip()
+    k = re.sub(r"^[_\W]+|[_\W]+$", "", k)
+    return re.sub(r"[_\s]+", " ", k).strip()
+
+
+def parse_chunk_text(text):
+    """One chunk -> ordered [(key, value)] with keys normalised."""
+    text = str(text)
+    out, last_key, last_end = [], None, 0
+    for m in KV_RE.finditer(text):
+        seg = text[last_end:m.start()].strip()
+        if last_key is not None:
+            out.append((last_key, seg))
+        elif seg:
+            out.append(("(preamble)", seg))
+        last_key, last_end = clean_key(m.group(1)), m.end()
+    tail = text[last_end:].strip()
+    if last_key is not None:
+        out.append((last_key, tail))
+    elif tail:
+        out.append(("(body)", tail))
+    return [(k, v.strip().strip(",").strip()) for k, v in out]
+
+
+def split_chunks(raw, split_key=None):
+    """document_chunks -> list of chunk strings."""
+    if raw is None or str(raw).strip() in ("", "[]", "null", "None", "nan"):
+        return []
+    txt = str(raw).strip()
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            v = loader(txt)
+            if isinstance(v, list):
+                return [x if isinstance(x, str) else json.dumps(x) for x in v]
+            if isinstance(v, (str, dict)):
+                return [v if isinstance(v, str) else json.dumps(v)]
+        except Exception:
+            pass
+    key = split_key or CHUNK_SPLIT_KEY
+    if not key:
+        m = KV_RE.search(txt)
+        key = m.group(1).strip() if m else None
+    if not key:
+        return [txt]
+    marker = re.compile(r"\*\*\s*" + re.escape(key) + r"\s*:\s*\*\*")
+    starts = [m.start() for m in marker.finditer(txt)]
+    if len(starts) <= 1:
+        return [txt]
+    bounds = starts + [len(txt)]
+    out = []
+    for lo, hi in zip(bounds, bounds[1:]):
+        piece = txt[lo:hi].strip().rstrip(",").strip()
+        if piece:
+            out.append(piece)
+    return out
+
+
+def split_table_segments(value):
+    """Walk a value and return ordered segments: ('text', s) / ('table', rows).
+
+    Order matters. A sentence printed after a table must stay after it, or
+    a qualifier ("the APAC row is superseded from July") lands against the
+    wrong rows and the audit inherits the misreading it is looking for.
     """
-    # accept dict passthrough from old format
-    if isinstance(item, dict):
-        return {
-            "doc_title":  str(item.get("doc_title") or item.get("title")
-                              or item.get("file_name") or "?"),
-            "geography":  str(item.get("geography_scope")
-                              or item.get("geography") or ""),
-            "extras":     {},
-            "misc":       "",
-            "text":       str(item.get("text") or item.get("content") or ""),
-        }
+    segs, run, buf = [], [], []
 
-    raw_str   = str(item)
-    lines     = raw_str.splitlines()
-
-    # regex: optional ** on key side, colon separator, value on the right
-    # matches:  **File Name:** foo   |   File Name: foo   |   **Geo:** foo
-    kv_re = re.compile(
-        r"^\s*\*{0,2}([^*:\n]+?)\*{0,2}\s*:\s*(.*)$"
-    )
-
-    fields: dict = {}
-    misc_lines: list = []
-
-    # A pipe-delimited table row contains colons only by accident, but it must
-    # never be split on one: "| Limit: | 500 |" is a table row, not a field.
-    # Row structure also has to survive, or the judge cannot tell which value
-    # belongs to which row and cannot verify a table-based answer.
-    is_table_row = lambda s: s.strip().startswith("|") or s.count("|") >= 2
-
-    for line in lines:
-        if is_table_row(line):
-            misc_lines.append(line.rstrip())      # keep verbatim, keep the row
-            continue
-        m = kv_re.match(line)
-        if m:
-            key   = re.sub(r"\s+", "_", m.group(1).strip().lower())
-            value = m.group(2).strip()
-            # strip residual bold markers from value
-            value = re.sub(r"\*{1,2}(.*?)\*{1,2}", r"\1", value).strip()
-            fields[key] = value
+    def flush_table():
+        rows = [[c.strip() for c in r.strip().strip("|").split("|")]
+                for r in run if not re.fullmatch(r"[\s|:-]+", r)]
+        if len(rows) >= 2:
+            segs.append(("table", rows))
         else:
-            clean = re.sub(r"\*{1,2}(.*?)\*{1,2}", r"\1", line).strip()
-            if clean:
-                misc_lines.append(clean)
+            buf.extend(run)          # a lone pipe row is not a table
+        run.clear()
 
-    # canonical field mapping
-    def pick(*keys):
-        for k in keys:
-            if fields.get(k):
-                return fields.pop(k)
+    def flush_text():
+        s = "\n".join(buf).strip()
+        if s:
+            segs.append(("text", s))
+        buf.clear()
+
+    for ln in str(value).split("\n"):
+        if PIPE_ROW.match(ln):
+            if buf:
+                flush_text()
+            run.append(ln)
+        else:
+            if run:
+                flush_table()
+            buf.append(ln)
+    if run:
+        flush_table()
+    flush_text()
+    return segs
+
+
+def render_table(rows):
+    """Re-emit a table with its header named on every row.
+
+    A model reading '|EMEA|USD 50,000|' has to remember which column is
+    which and which row it is on; that is exactly the mistake this audit
+    keeps finding. Naming the header beside each value removes the step.
+    """
+    if not rows:
         return ""
+    head, body = rows[0], rows[1:]
+    if not body:
+        return "| " + " | ".join(head) + " |"
+    out = ["TABLE (each row listed field by field; a value belongs ONLY to "
+           "the row it is printed under):"]
+    for i, r in enumerate(body, 1):
+        cells = [f"{head[j] if j < len(head) else f'col{j+1}'}={v}"
+                 for j, v in enumerate(r)]
+        out.append(f"  row {i}: " + "; ".join(cells))
+    return "\n".join(out)
 
-    doc_title  = pick("document_title", "title", "file_name", "file name",
-                       "document_name")
-    geography  = pick("geography_scope", "geography_scope_", "geography",
-                      "geo_scope", "geo")
-    # everything else that had a colon goes to extras
-    extras     = {k: v for k, v in fields.items() if v}
-    # newline, not " | ": joining with a pipe destroys markdown tables
-    misc_text  = "\n".join(misc_lines)
 
-    # build the text the judge reads: structured fields first, then misc
-    text_parts = []
-    if doc_title:
-        text_parts.append(f"Document: {doc_title}")
-    if geography:
-        text_parts.append(f"Geography: {geography}")
-    for k, v in extras.items():
-        text_parts.append(f"{k.replace('_', ' ').title()}: {v}")
-    if misc_text:
-        text_parts.append(misc_text)
+# Which key holds the title, in order of preference. Matched against the
+# normalised key, so 'document title' covers __DOCUMENT_TITLE__.
+TITLE_KEYS = ["document title", "doc title", "file name", "filename",
+              "title", "document", "source", "policy name"]
+GEO_KEYS   = ["geography", "geo", "region", "country", "jurisdiction",
+              "applicability"]
 
-    return {
-        "doc_title": doc_title or "?",
-        "geography": geography,
-        "extras":    extras,
-        "misc":      misc_text,
-        "text":      "\n".join(text_parts),
-    }
+
+def _pick(kv, wanted):
+    low = [(k.lower(), v) for k, v in kv]
+    for w in wanted:
+        for k, v in low:
+            if k == w:
+                return v
+    for w in wanted:
+        for k, v in low:
+            if w in k:
+                return v
+    return ""
 
 
 def parse_chunks(raw):
-    """Parse document_chunks column.
+    """document_chunks -> [{doc_title, geography, extras, tables, text}].
 
-    raw is expected to be a JSON list of items, where each item is either:
-      - a string with **Key:** Value lines  (new format)
-      - a dict                              (legacy format)
-      - anything else -> treated as plain text
-
-    Returns a list of dicts with keys: text, doc_title, geography, extras, misc.
+    text is rebuilt as 'Key: value' lines so the judge reads clean fields
+    rather than inline ** markers, with any pipe table re-emitted row by
+    row underneath its key.
     """
-    if pd.isna(raw) or str(raw).strip() in ("", "[]", "null", "None"):
-        return []
+    out = []
+    for raw_text in split_chunks(raw):
+        kv = parse_chunk_text(raw_text)
+        title = _pick(kv, TITLE_KEYS) or "?"
+        geo   = _pick(kv, GEO_KEYS)
+        lines, all_tables = [], []
+        for k, v in kv:
+            if not v:
+                continue
+            segs = split_table_segments(v)
+            if not any(t == "table" for t, _ in segs):
+                lines.append(f"{k}: {v}")
+                continue
+            lines.append(f"{k}:")
+            for kind, payload in segs:
+                if kind == "table":
+                    all_tables.append(payload)
+                    lines.append(render_table(payload))
+                else:
+                    lines.append(payload)
+        out.append({
+            "doc_title": re.sub(r"\*+", "", str(title)).strip()[:80],
+            "geography": str(geo).strip(),
+            "extras": dict(kv),
+            "tables": all_tables,
+            "misc": "",
+            "text": "\n".join(lines),
+        })
+    return out
 
-    # try JSON parse first
-    try:
-        obj = json.loads(raw)
-    except (TypeError, ValueError):
-        # not JSON: treat the whole value as one plain-text chunk
-        return [_parse_chunk_item(str(raw))]
 
-    # normalise to list
-    if not isinstance(obj, list):
-        obj = [obj]
+# --------------------------------------------------------------------------
+# CLARIFICATION SURFACE FORM
+# --------------------------------------------------------------------------
+# A clarification is only a clarification if the agent actually used its
+# clarification template. Without this gate the route classifier will call
+# any response that happens to contain a question "clarified", and the
+# unnecessary-clarification theme then fires on rows that never asked the
+# user anything.
+#
+# Edit CLARIFY_MARKERS to match the live template. The loader prints how
+# many clarified rows carry a marker, so a wrong list shows up immediately
+# as a count of zero rather than as a silently empty theme.
+CLARIFY_MARKERS = [
+    "please clarify",
+]
+CLARIFY_EXPECTED_QUESTIONS = 3
+CLARIFY_EXPECTED_OPTIONS   = 3
 
-    return [_parse_chunk_item(item) for item in obj]
+_OPTION_LINE = re.compile(
+    r"^\s*(?:[-*•●]|\(?[a-dA-D][\).]|\(?[1-9][\).]|option\s*[1-9a-dA-D]\s*[:.\)])\s*(.+)$",
+    re.I)
+_QUESTION_LINE = re.compile(
+    r"^\s*(?:[-*\u2022\u25cf]\s*|\(?\d+[\).]\s*)?(.*\?)\s*$")
+
+
+def parse_clarification(response):
+    """Pull the clarification template apart: marker, questions, options.
+
+    Returns {marker, questions: [{text, options: [...]}], n_questions,
+    n_options, well_formed}. Tolerant about layout because the template is
+    only known by example: numbered or unnumbered questions, options as
+    a) / 1. / - / bullet. What it will NOT do is invent a question where
+    the response has none.
+    """
+    text = str(response or "")
+    low  = text.lower()
+    marker = next((m for m in CLARIFY_MARKERS if m in low), "")
+
+    questions, current = [], None
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        om = _OPTION_LINE.match(line)
+        # an option line that is itself a question belongs to the question
+        # list only if we have not opened one yet
+        if om and current is not None and not line.endswith("?"):
+            current["options"].append(om.group(1).strip())
+            continue
+        qm = _QUESTION_LINE.match(line)
+        if qm:
+            current = {"text": qm.group(1).strip(), "options": []}
+            questions.append(current)
+            continue
+        if om and current is not None:
+            current["options"].append(om.group(1).strip())
+
+    n_q = len(questions)
+    n_o = sum(len(q["options"]) for q in questions)
+    # "well formed" means it looks like the template we were told about:
+    # the marker, roughly the expected number of questions, and options
+    # hanging off them. Used for diagnosis, never to clear a flag.
+    well = bool(marker) and n_q >= 1 and n_o >= 1
+    return {"marker": marker, "questions": questions,
+            "n_questions": n_q, "n_options": n_o, "well_formed": well}
+
+
+def clarify_diagnostics(df):
+    """Pre-flight: do any responses carry a clarification marker?
+
+    Run BEFORE the judge calls. The marker gate forces
+    CLARIFICATION_UNNECESSARY to FALSE on any row without a marker, so a
+    CLARIFY_MARKERS list that does not match the live template silently
+    empties the theme. Printing the count here makes that a visible zero
+    before a single token is spent, rather than a clean-looking result.
+    """
+    rows = df.to_dict("records")
+    pc = [parse_clarification(r.get("response")) for r in rows]
+    have = [p for p in pc if p["marker"]]
+    print(f"clarification gate: {len(have)}/{len(rows)} responses carry a "
+          f"marker from CLARIFY_MARKERS={CLARIFY_MARKERS}")
+    if not have:
+        print("  WARNING: no response matches any marker. Every "
+              "CLARIFICATION_UNNECESSARY will be forced FALSE and the "
+              "unnecessary_clarification theme will be empty. Put the live "
+              "template wording into CLARIFY_MARKERS before running.")
+        return
+    qs = sorted(p["n_questions"] for p in have)
+    os_ = sorted(p["n_options"] for p in have)
+    print(f"  questions per clarification: min {qs[0]} / median "
+          f"{qs[len(qs)//2]} / max {qs[-1]}  "
+          f"(expected {CLARIFY_EXPECTED_QUESTIONS})")
+    print(f"  options per clarification:   min {os_[0]} / median "
+          f"{os_[len(os_)//2]} / max {os_[-1]}  "
+          f"(expected {CLARIFY_EXPECTED_QUESTIONS * CLARIFY_EXPECTED_OPTIONS})")
+    odd = sum(1 for p in have
+              if p["n_questions"] != CLARIFY_EXPECTED_QUESTIONS)
+    if odd:
+        print(f"  note: {odd} marked response(s) do not have exactly "
+              f"{CLARIFY_EXPECTED_QUESTIONS} questions. Not an error - the "
+              f"parse is only used for diagnosis - but if the count is high "
+              f"the template parse may need adjusting.")
 
 
 def build_history(df):
@@ -867,7 +1159,8 @@ def render(name, c):
         note   = (f" (top {len(titles)} of {len(CORPUS_INDEX)} by relevance)"
                   if len(CORPUS_INDEX) > CORPUS_TOP_N else "")
         return "## POLICY CORPUS INDEX" + note + "\n" + (
-            "\n".join(f"- {x}" for x in titles) or "(not provided)")
+            "\n".join(f"- {x['display']}" for x in titles)
+            or "(not provided)")
     if name == "history":
         return "## CONVERSATION HISTORY (earlier turns only)\n" + (
             "\n".join(f"{m['role']}: {m['content']}"
@@ -1152,7 +1445,7 @@ def phase_a(row, hist):
         best = float(sim[order[0]])
         st["flags"]["CORPUS_TITLE_MATCHED"] = b(best >= CORPUS_MATCH_THRESHOLD)
         st["ev"]["CORPUS_TITLE_MATCHED"] = (
-            f"best title '{CORPUS_INDEX[order[0]]}' score {best:.3f} "
+            f"best title '{CORPUS_INDEX[order[0]]['title']}' score {best:.3f} "
             f"(threshold {CORPUS_MATCH_THRESHOLD})")
     else:
         st["flags"]["CORPUS_TITLE_MATCHED"] = UNKNOWN
@@ -1302,6 +1595,25 @@ def phase_c(st):
 
     for r_ in ROUTES:
         f[f"ROUTE_{r_.upper()}"] = b(route == r_)
+
+    # --- clarification surface form ------------------------------------
+    # A clarification can only be called unnecessary if the agent actually
+    # issued its clarification template. The judge can be persuaded that
+    # any question is a clarification; the template either appears or it
+    # does not, so this is settled in code and overrides the judge.
+    pc = parse_clarification(row["response"])
+    f["RESPONSE_HAS_CLARIFY_MARKER"] = b(bool(pc["marker"]))
+    f["CLARIFY_WELL_FORMED"]         = b(pc["well_formed"])
+    st["clarify"] = pc
+    if route == "clarified" and not pc["marker"]:
+        for k in ("CLARIFICATION_UNNECESSARY", "CLARIFY_QUESTION_DIVERTS"):
+            if f.get(k) == TRUE:
+                f[k] = FALSE
+                ev[k] = dict(ev.get(k) or {}, code_override=(
+                    "forced FALSE: the response carries no clarification "
+                    f"marker from {CLARIFY_MARKERS}, so it is not the "
+                    "clarification template and cannot be an unnecessary "
+                    "clarification"))
     st["route"] = route
     return st
 
@@ -1535,8 +1847,13 @@ def themes_for(route, f):
     #   3. the retrieved chunks do not resolve it
     # If ANY ONE of them is clear, the agent had what it needed and the
     # clarification was unnecessary.
-    if route == "clarified":
+    # The marker requirement applies to the THEME too, not only the flag.
+    # The theme is driven by the three-source rule rather than by
+    # CLARIFICATION_UNNECESSARY, so gating the flag alone would leave the
+    # theme firing on rows the flag had just cleared.
+    if route == "clarified" and f.get("RESPONSE_HAS_CLARIFY_MARKER") == TRUE:
         resolved_by = []
+        # ground (a): the answer was already available to the agent
         if f.get("REQUEST_IS_AMBIGUOUS") == FALSE:
             resolved_by.append("request_was_clear")
         if f.get("HISTORY_HAS_NEEDED_INFO") == TRUE:
@@ -1547,6 +1864,9 @@ def themes_for(route, f):
         # so clarifying "about what?" against old context is unnecessary
         if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
             resolved_by.append("self_contained_new_topic")
+        # ground (b): it asked about something the answer does not turn on
+        if f.get("CLARIFY_QUESTION_DIVERTS") == TRUE:
+            resolved_by.append("question_diverts")
 
         if resolved_by:
             # history specifically is a continuity failure, which points at
@@ -1700,6 +2020,13 @@ def root_cause_for(route, f, themes):
     # unnecessary_clarification and returned guardrail-flavoured causes,
     # which made every cause below it dead code.
     if "unnecessary_clarification" in themes:
+        # asking about a dimension the answer does not turn on is a
+        # different defect from asking about one already supplied: the
+        # first is the routing prompt choosing the wrong question, the
+        # second is it failing to read what it already had
+        if f.get("CLARIFY_QUESTION_DIVERTS") == TRUE:
+            return {"stage": "decision",
+                    "cause": "clarified_with_irrelevant_question"}
         if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
             return {"stage": "decision",
                     "cause": "clarified_though_chunks_resolved_it"}
@@ -2077,6 +2404,13 @@ def finish(st):
         "gap_type":           gap,
         # clarification rows: which of request/history/chunks was already
         # clear. Non-empty means clarifying was unnecessary.
+        "clarify_has_marker":      st["flags"].get(
+                                       "RESPONSE_HAS_CLARIFY_MARKER", ""),
+        "clarify_questions":       "; ".join(
+                                       q["text"] for q in
+                                       st.get("clarify", {}).get(
+                                           "questions", []))[:500],
+        "clarify_n_questions":     st.get("clarify", {}).get("n_questions", ""),
         "clarify_sources_clear":   clear_src,
         "clarify_sources_unclear": unclear_src,
         "expected_behavior":  is_expected,
@@ -2195,6 +2529,7 @@ def run_audit(path, resume=True):
     df           = load(path)
     hist         = build_history(df)
     static_ids, norm_map = tag_static(df)
+    clarify_diagnostics(df)
 
     if not resume and CHECKPOINT_PATH and os.path.exists(CHECKPOINT_PATH):
         os.remove(CHECKPOINT_PATH)
@@ -2327,6 +2662,8 @@ CAUSE_OWNER_EXPANDED = {
     "refused_answerable_generally":        "guardrail / prompt",
     "clarified_though_chunks_resolved_it": "routing prompt",
     "clarified_though_request_was_clear":  "routing prompt",
+    "clarified_with_irrelevant_question":  "routing prompt",
+    "clarified_with_irrelevant_question":  "routing prompt",
     "no_next_step_in_template":            "static response design",
     "prompt_or_routing":                   "prompt / routing",
     "generation_or_communication":         "response prompt",
@@ -2398,9 +2735,12 @@ def all_causes_for(r):
 
     # ---- 4. decision ------------------------------------------------
     if "unnecessary_clarification" in themes:
+        if f("CLARIFY_QUESTION_DIVERTS") == TRUE:
+            out.append(("decision", "clarified_with_irrelevant_question"))
         if f("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
             out.append(("decision", "clarified_though_chunks_resolved_it"))
-        elif f("REQUEST_IS_TOPIC_CHANGE") != TRUE:
+        elif (f("REQUEST_IS_TOPIC_CHANGE") != TRUE
+                and f("CLARIFY_QUESTION_DIVERTS") != TRUE):
             out.append(("decision", "clarified_though_request_was_clear"))
 
     if "excessive_guardrail" in themes:
