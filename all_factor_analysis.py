@@ -833,8 +833,141 @@ def _driver_frame():
     return pd.DataFrame(out)
 
 
-def build_charts():
-    nfull = max(len(audit_full), 1)
+def _sankey(links, title, fname, left_order=None, max_right=10,
+            lcolor=None, figsize=None):
+    """Two-column flow diagram. links = [(left, right, value), ...].
+
+    A heatmap asks you to decode colour into magnitude. A flow shows one
+    source fanning out to several targets directly, which is the shape of
+    factor -> cause: one thing the user felt, several things behind it.
+    """
+    from matplotlib.path import Path
+    from matplotlib.patches import PathPatch
+
+    if not links:
+        return
+    df = (pd.DataFrame(links, columns=["L", "R", "V"])
+            .groupby(["L", "R"], as_index=False)["V"].sum())
+
+    # keep the biggest targets; fold the rest so the right column stays legible
+    OTHER = "other causes"
+    rtot = df.groupby("R")["V"].sum().sort_values(ascending=False)
+    if len(rtot) > max_right:
+        keep = set(rtot.head(max_right - 1).index)
+        df["R"] = df["R"].where(df["R"].isin(keep), OTHER)
+        df = df.groupby(["L", "R"], as_index=False)["V"].sum()
+        rtot = df.groupby("R")["V"].sum()
+
+    ltot = df.groupby("L")["V"].sum()
+    lnodes = [x for x in (left_order or []) if x in ltot.index]
+    lnodes += [x for x in ltot.sort_values(ascending=False).index
+               if x not in lnodes]
+    li = {nd: i for i, nd in enumerate(lnodes)}
+
+    # Order the right column by where its inflow comes from, not by size.
+    # Sizing the right column by total is what makes a Sankey a hairball:
+    # every ribbon then has to cross the ones above it. A barycentre sort
+    # lets the bundles run roughly parallel and the picture becomes legible.
+    bary = {nd: sum(r.V * li[r.L] for r in df[df.R == nd].itertuples())
+                / max(rtot[nd], 1e-9) for nd in rtot.index}
+    rnodes = sorted([x for x in rtot.index if x != OTHER], key=bary.get)
+    if OTHER in rtot.index:
+        rnodes.append(OTHER)          # the residual belongs at the bottom
+    ri = {nd: i for i, nd in enumerate(rnodes)}
+
+    GAP, total = 0.022, float(df["V"].sum())
+
+    def layout(nodes, tot):
+        span = 1.0 - GAP * (len(nodes) - 1)
+        pos, y = {}, 1.0
+        for nd in nodes:
+            h = span * tot[nd] / total
+            pos[nd] = (y - h, y)        # (bottom, top)
+            y -= h + GAP
+        return pos
+
+    lp, rp = layout(lnodes, ltot), layout(rnodes, rtot)
+
+    # Hue follows the factor, not its position in this chart. A slice where
+    # nothing was Incorrect must not repaint Incomplete in Incorrect's blue,
+    # or two charts side by side disagree about what each colour means.
+    pal = lcolor or CAT
+    canon = list(left_order or lnodes)
+    canon += [nd for nd in lnodes if nd not in canon]
+    colors = {nd: pal[canon.index(nd) % len(pal)] for nd in lnodes}
+    span = 1.0 - GAP * (len(lnodes) - 1)
+
+    # Stack each node's ribbons in the order of the node at the other end,
+    # so a bundle leaving one factor arrives in the same top-to-bottom order
+    # it left in. Without this the ribbons braid inside their own bundle.
+    ends, lcur = {}, {nd: lp[nd][1] for nd in lnodes}
+    for nd in lnodes:
+        for r in sorted(df[df.L == nd].itertuples(), key=lambda r: ri[r.R]):
+            h = span * r.V / total
+            ends[(r.L, r.R)] = [lcur[nd], lcur[nd] - h]
+            lcur[nd] -= h
+    rcur = {nd: rp[nd][1] for nd in rnodes}
+    for nd in rnodes:
+        for r in sorted(df[df.R == nd].itertuples(), key=lambda r: li[r.L]):
+            h = span * r.V / total
+            ends[(r.L, r.R)] += [rcur[nd], rcur[nd] - h]
+            rcur[nd] -= h
+
+    fig, ax = plt.subplots(
+        figsize=figsize or (11, max(4.4, .52 * max(len(lnodes),
+                                                   len(rnodes)) + 1.9)))
+    X0, X1, NW = .085, .70, .022
+    xa, xb = X0 + NW, X1
+    cx = (xa + xb) / 2
+
+    # draw thickest first so the thin ribbons stay visible on top
+    for r in df.sort_values("V", ascending=False).itertuples():
+        y0t, y0b, y1t, y1b = ends[(r.L, r.R)]
+        verts = [(xa, y0t), (cx, y0t), (cx, y1t), (xb, y1t),
+                 (xb, y1b), (cx, y1b), (cx, y0b), (xa, y0b), (xa, y0t)]
+        codes = [Path.MOVETO, Path.CURVE4, Path.CURVE4, Path.CURVE4,
+                 Path.LINETO, Path.CURVE4, Path.CURVE4, Path.CURVE4,
+                 Path.CLOSEPOLY]
+        ax.add_patch(PathPatch(Path(verts, codes),
+                               facecolor=colors[r.L], alpha=.45,
+                               edgecolor="none", zorder=2))
+
+    for nd in lnodes:
+        b, t = lp[nd]
+        ax.add_patch(plt.Rectangle((X0, b), NW, t - b,
+                                   facecolor=colors[nd], zorder=4))
+        ax.text(X0 - .014, (b + t) / 2, f"{nd}  ({int(round(ltot[nd]))})",
+                ha="right", va="center", fontsize=10.5, color=INK)
+    for nd in rnodes:
+        b, t = rp[nd]
+        ax.add_patch(plt.Rectangle((X1, b), NW, t - b,
+                                   facecolor="#8f8e88", zorder=4))
+        ax.text(X1 + NW + .014, (b + t) / 2,
+                f"{nd.replace('_', ' ')}  ({int(round(rtot[nd]))})",
+                ha="left", va="center", fontsize=10.5, color=INK)
+
+    ax.set_xlim(0, 1.0)
+    ax.set_ylim(-.03, 1.04)
+    ax.axis("off")
+    ax.set_title(title)
+    _finish(fig, ax, fname, grid=False)
+
+
+_TRIAGE = {}
+
+
+def triage_masks(verbose=False):
+    """(m_exp, m_rev, m_samp, exp_derived) — one definition, shared.
+
+    expected_behavior may arrive blank after a round-trip through the
+    store. The pipeline sets themes = [] whenever a row is expected, so a
+    BLANK THEME is the surviving signal — not "wasn't flagged". The two
+    differ: a themed row that stayed below the review bar is not expected
+    behaviour, it is an unraised defect.
+    """
+    if _TRIAGE:
+        return (_TRIAGE["exp"], _TRIAGE["rev"], _TRIAGE["samp"],
+                _TRIAGE["derived"])
 
     def mask(col):
         c = _col(col)
@@ -843,13 +976,8 @@ def build_charts():
 
     m_rev, m_samp = mask("needs_review"), mask("in_sample_queue")
     m_exp = mask("expected_behavior")
-
-    # expected_behavior may arrive blank after a round-trip through the
-    # store. The pipeline sets themes = [] whenever a row is expected, so
-    # a BLANK THEME is the surviving signal — not "wasn't flagged".
-    # The two differ: a themed row that stayed below the review bar is
-    # not expected behaviour, it is an unraised defect.
     exp_derived = not m_exp.any()
+
     if exp_derived:
         ec = _col("expected_behavior")
         vals = (dict(audit_full[ec].map(_val).value_counts()) if ec
@@ -862,10 +990,21 @@ def build_charts():
         else:
             no_theme = pd.Series(True, index=audit_full.index)
         m_exp = no_theme & ~m_rev
-        print(f"\nnote: expected_behavior carries no TRUE values ({vals}).")
-        print(f"      Deriving it from a blank theme + not flagged, which "
-              f"is how the pipeline writes an expected row.")
-        print(f"      derived cleared: {int(m_exp.sum())} of {nfull}")
+        if verbose:
+            print(f"\nnote: expected_behavior carries no TRUE values "
+                  f"({vals}).")
+            print(f"      Deriving it from a blank theme + not flagged, "
+                  f"which is how the pipeline writes an expected row.")
+            print(f"      derived cleared: {int(m_exp.sum())} of "
+                  f"{len(audit_full)}")
+
+    _TRIAGE.update(exp=m_exp, rev=m_rev, samp=m_samp, derived=exp_derived)
+    return m_exp, m_rev, m_samp, exp_derived
+
+
+def build_charts():
+    nfull = max(len(audit_full), 1)
+    m_exp, m_rev, m_samp, exp_derived = triage_masks(verbose=True)
 
     # four mutually exclusive buckets that sum to the total
     n_rev  = int(m_rev.sum())
@@ -1021,43 +1160,22 @@ def build_charts():
                 fig.colorbar(im, ax=ax, shrink=.75, label="interactions")
                 _finish(fig, ax, "07_cooccurrence", grid=False)
 
-    # --- 8. Factor x cause heatmap -----------------------------------
+    # --- 8. Factor -> cause flow -------------------------------------
     cc = _col("all_causes") or _col("cause")
     if len(dd) and cc:
-        pr = []
+        links = []
         for r, f in zip(rows, facts):
             cs = [c.strip() for c in str(r.get(cc) or "").split(";")
                   if c.strip()] or ["(none assigned)"]
             for fa in f:
+                # one interaction with two causes splits its weight, so
+                # the column totals still sum to the interaction count
                 for c in cs:
-                    pr.append({"Factor": fa, "Cause": c})
-        if pr:
-            pv = pd.crosstab(pd.DataFrame(pr)["Factor"],
-                             pd.DataFrame(pr)["Cause"])
-            fig, ax = plt.subplots(
-                figsize=(max(7, 1.5 + 1.25 * pv.shape[1]),
-                         max(3, 1.4 + .62 * pv.shape[0])))
-            im = ax.imshow(pv.values, cmap=SEQ, aspect="auto")
-            ax.set_xticks(range(pv.shape[1]),
-                          [c.replace("_", " ") for c in pv.columns],
-                          rotation=32, ha="right", fontsize=9)
-            ax.set_yticks(range(pv.shape[0]), pv.index, fontsize=9)
-            hi = pv.values.max() or 1
-            for i in range(pv.shape[0]):
-                for j in range(pv.shape[1]):
-                    v = pv.values[i, j]
-                    if v:
-                        ax.text(j, i, v, ha="center", va="center", fontsize=9,
-                                color="white" if v > hi * .55 else INK)
-            ax.set_title("Factor × root cause")
-            ax.grid(False)
-            fig.tight_layout()
-            if CHART_DIR:
-                import os
-                os.makedirs(CHART_DIR, exist_ok=True)
-                fig.savefig(f"{CHART_DIR}/08_factor_cause.png", dpi=CHART_DPI,
-                            facecolor=SURFACE, bbox_inches="tight")
-            plt.show()
+                    links.append((fa, c, 1.0 / len(cs)))
+        _sankey(links,
+                "What the user experienced  \u2192  what caused it",
+                "08_factor_cause",
+                left_order=[x for x in FACTORS])
 
     # --- 9. Owner workload -------------------------------------------
     oc = _col("cause_owners") or _col("cause_owner")
@@ -1115,6 +1233,343 @@ try:
     build_charts()
 except Exception as _e:
     print(f"\ncharts skipped: {type(_e).__name__}: {_e}")
+
+# ---- 6b. FEEDBACK INSIGHTS ----------------------------------------------
+# Three charts, and all three need user feedback. They answer, in order:
+#   1. Is the audit right?            (agreement with the user)
+#   2. Which defects actually matter? (factor -> dissatisfaction lift)
+#   3. Is "correct" good enough?      (expected behaviour -> satisfaction)
+#
+# Feedback will be sparse. Every chart prints n and marks any group too
+# small to read, because a rate over 4 interactions is not a rate.
+FEEDBACK_COL   = "user_feedback"   # column holding the user's verdict
+FB_MIN_GROUP   = 5                 # below this, a rate is not reported
+FB_RATE_MIN    = 30                # negatives needed before 6b draws rates
+DISLIKE_CHART_MIN = 6              # dislikes needed for their own chart
+
+_POS = {"positive", "good", "up", "thumbs_up", "thumbsup", "yes", "1",
+        "satisfied", "helpful", "4", "5", "true"}
+_NEG = {"negative", "bad", "down", "thumbs_down", "thumbsdown", "no", "0",
+        "unsatisfied", "unhelpful", "1.0", "2", "false"}
+
+
+def _fb(v):
+    """-> 'positive' | 'negative' | None (no feedback given)."""
+    s = str(v).strip().lower()
+    if s in ("", "nan", "none", "null"):
+        return None
+    if s in _POS and s not in ("1", "1.0"):
+        return "positive"
+    if s in _NEG:
+        return "negative"
+    if s in ("1", "1.0"):           # ambiguous: 1 = thumbs-up in most logs
+        return "positive"
+    return None
+
+
+def build_feedback_charts():
+    fc = _col(FEEDBACK_COL)
+    if not fc:
+        print(f"\nno '{FEEDBACK_COL}' column - skipping the feedback "
+              f"insights. Add it to the audit dataset to unlock them.")
+        return
+
+    fb = audit_full.copy()
+    fb["_fb"] = fb[fc].map(_fb)
+    fb = fb[fb["_fb"].notna()]
+    n = len(fb)
+    if n == 0:
+        print(f"\n'{FEEDBACK_COL}' has no usable values - skipping.")
+        return
+
+    cov = 100 * n / max(len(audit_full), 1)
+    print(f"\nfeedback on {n} of {len(audit_full)} interactions ({cov:.0f}%)")
+    n_neg = int((fb["_fb"] == "negative").sum())
+    if n_neg < FB_RATE_MIN:
+        print(f"  only {n_neg} negative — too few for the rate charts "
+              f"(need {FB_RATE_MIN}). Skipping 6b; the analysis page in 6c "
+              f"shows feedback as counts instead, which is honest at this "
+              f"volume.")
+        return
+
+    # the audit's own verdict, using the same derivation as the headline
+    _m_exp, _, _, _ = triage_masks()
+    fb["_cleared"] = _m_exp.reindex(fb.index).fillna(False).values
+    base_neg = (fb["_fb"] == "negative").mean()
+
+    # === 1. Does the audit agree with the user? =====================
+    cells = {
+        (True,  "positive"): ("Agreed clear",
+                              "audit cleared it, user was happy", OK_C),
+        (False, "negative"): ("Agreed defect",
+                              "audit flagged it, user was unhappy", OK_C),
+        (True,  "negative"): ("MISSED",
+                              "audit cleared it, user was unhappy", BAD_C),
+        (False, "positive"): ("False alarm",
+                              "audit flagged it, user was happy", CAT[3]),
+    }
+    grid = np.zeros((2, 2), int)
+    for (cl, f), _ in cells.items():
+        grid[0 if cl else 1][0 if f == "positive" else 1] = int(
+            ((fb["_cleared"] == cl) & (fb["_fb"] == f)).sum())
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.6))
+    for i, cl in enumerate([True, False]):
+        for j, f in enumerate(["positive", "negative"]):
+            name, desc, colr = cells[(cl, f)]
+            v = grid[i][j]
+            ax.add_patch(plt.Rectangle((j, 1 - i), 1, 1, facecolor=colr,
+                                       alpha=.16 if v else .05,
+                                       edgecolor=SURFACE, linewidth=3))
+            ax.text(j + .5, 1 - i + .66, f"{v}", ha="center", va="center",
+                    fontsize=26, fontweight="bold",
+                    color=colr if v else "#b9b8b2")
+            ax.text(j + .5, 1 - i + .36, name, ha="center", va="center",
+                    fontsize=11, fontweight="bold", color=INK)
+            ax.text(j + .5, 1 - i + .18, desc, ha="center", va="center",
+                    fontsize=8, color=INK_SOFT)
+    ax.set_xlim(0, 2); ax.set_ylim(0, 2)
+    ax.set_xticks([.5, 1.5], ["user: happy", "user: unhappy"])
+    ax.set_yticks([1.5, .5], ["audit:\ncleared", "audit:\nflagged"])
+    ax.tick_params(length=0)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    agree = grid[0][0] + grid[1][1]
+    ax.set_title(f"Does the audit agree with the user?   "
+                 f"{100 * agree / max(n, 1):.0f}% agreement  (n={n})")
+    _finish(fig, ax, "11_agreement", grid=False)
+
+    miss, alarm = grid[0][1], grid[1][0]
+    print(f"  missed      {miss}  (cleared, user unhappy) "
+          f"- what the audit lets through")
+    print(f"  false alarm {alarm}  (flagged, user happy) "
+          f"- what review time is spent on")
+
+    # === 2. Which factor actually predicts dissatisfaction? =========
+    fmap = {r.get("transaction_id"): f for r, f in zip(rows, facts)}
+    tid_c = _col("transaction_id") or "transaction_id"
+    lift = []
+    for fa in FACTORS:
+        sel = fb[fb[tid_c].map(lambda t: fa in (fmap.get(t) or {}))]
+        if len(sel) >= 1:
+            lift.append({"Factor": fa, "n": len(sel),
+                         "neg": (sel["_fb"] == "negative").mean()})
+    if lift:
+        ld = pd.DataFrame(lift).sort_values("neg")
+        fig, ax = plt.subplots(figsize=(9, max(3, .62 * len(ld) + 2)))
+        thin = ld["n"] < FB_MIN_GROUP
+        ax.hlines(ld["Factor"], base_neg, ld["neg"],
+                  color="#c9c8c2", linewidth=2, zorder=2)
+        ax.scatter(ld["neg"], ld["Factor"],
+                   s=[90 if not t else 55 for t in thin],
+                   color=[BAD_C if not t else "#d9b8b0" for t in thin],
+                   zorder=3)
+        ax.axvline(base_neg, color=INK_SOFT, linestyle="--", linewidth=1.2,
+                   zorder=1)
+        # axes-fraction y, not data y: with one or two factors a data-y
+        # label falls outside the axes and bbox_inches="tight" then
+        # inflates the saved image several times over
+        ax.annotate(f"  all interactions: {100 * base_neg:.0f}% unhappy",
+                    xy=(base_neg, 1.02), xycoords=("data", "axes fraction"),
+                    fontsize=9, color=INK_SOFT, va="bottom", ha="left",
+                    annotation_clip=False)
+        for _, r in ld.iterrows():
+            ax.text(r["neg"] + .02, r["Factor"],
+                    f"{100 * r['neg']:.0f}%  (n={int(r['n'])})"
+                    + ("  too few" if r["n"] < FB_MIN_GROUP else ""),
+                    va="center", fontsize=9,
+                    color=INK if r["n"] >= FB_MIN_GROUP else INK_SOFT)
+        ax.set_xlim(0, max(1.0, ld["neg"].max() * 1.45))
+        ax.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{100 * v:.0f}%"))
+        ax.set_title("Which factor actually predicts an unhappy user?\n"
+                     "distance from the dashed line is what the factor costs")
+        _finish(fig, ax, "12_factor_lift", "share of users unhappy")
+
+    # === 3. Is "correct" good enough? ===============================
+    rc = _col("expected_reason")
+    if rc:
+        e = fb[fb["_cleared"]].copy()
+        e["_r"] = e[rc].fillna("(not recorded)").replace("", "(not recorded)")
+        g = (e.groupby(["_r", "_fb"]).size().unstack(fill_value=0)
+               .rename(columns=str))
+        for c in ("positive", "negative"):
+            if c not in g.columns:
+                g[c] = 0
+        g["tot"] = g["positive"] + g["negative"]
+        g = g[g["tot"] > 0].sort_values("tot")
+        if len(g):
+            fig, ax = plt.subplots(figsize=(10, max(3, .62 * len(g) + 2.2)))
+            lbl = [x.replace("_", " ") for x in g.index]
+            ax.barh(lbl, g["positive"], color=OK_C, height=.6,
+                    label="user happy", zorder=3,
+                    edgecolor=SURFACE, linewidth=1.6)
+            ax.barh(lbl, g["negative"], left=g["positive"], color=BAD_C,
+                    height=.6, label="user unhappy", zorder=3,
+                    edgecolor=SURFACE, linewidth=1.6)
+            for y, (p, ng, t) in enumerate(zip(g["positive"], g["negative"],
+                                               g["tot"])):
+                if p: ax.text(p / 2, y, int(p), ha="center", va="center",
+                              fontsize=8, color="white", fontweight="bold")
+                if ng: ax.text(p + ng / 2, y, int(ng), ha="center",
+                               va="center", fontsize=8, color="white",
+                               fontweight="bold")
+                ax.text(t + t * .03, y,
+                        f"{100 * ng / t:.0f}% unhappy"
+                        + ("  (too few)" if t < FB_MIN_GROUP else ""),
+                        va="center", fontsize=9,
+                        color=INK if t >= FB_MIN_GROUP else INK_SOFT)
+            ax.set_xlim(0, g["tot"].max() * 1.45)
+            ax.legend(frameon=False, ncol=2, loc="upper center",
+                      bbox_to_anchor=(.5, -.18), fontsize=9)
+            ax.set_title("The agent did the right thing — did the user "
+                         "accept it?\nevery row here was cleared by the audit")
+            _finish(fig, ax, "13_expected_vs_feedback", "interactions")
+
+
+try:
+    build_feedback_charts()
+except Exception as _e:
+    print(f"\nfeedback charts skipped: {type(_e).__name__}: {_e}")
+
+
+
+# ---- 6c. ANALYSIS PAGE --------------------------------------------------
+# Three visuals that hold up at low feedback volume. Feedback appears as an
+# annotation layer, never as a rate: with single-digit dislikes a percentage
+# is not a measurement, but WHERE those dislikes landed still is a finding.
+def build_analysis_page():
+    m_exp, m_rev, m_samp, derived = triage_masks()
+    nfull = len(audit_full)
+
+    fc = _col(FEEDBACK_COL)
+    fb = (audit_full[fc].map(_fb) if fc
+          else pd.Series(None, index=audit_full.index, dtype=object))
+    disliked = fb.eq("negative")
+    n_dis = int(disliked.sum())
+
+    # one label per row, mutually exclusive, same order as the triage bar
+    outcome = pd.Series("Themed, below bar", index=audit_full.index)
+    outcome[m_exp & ~m_rev & ~m_samp] = "Expected behaviour"
+    outcome[m_samp & ~m_rev] = "Control sample"
+    outcome[m_rev] = "Flagged for review"
+    ORDER = ["Expected behaviour", "Control sample",
+             "Themed, below bar", "Flagged for review"]
+    CMAP = {"Expected behaviour": OK_C, "Control sample": CAT[0],
+            "Themed, below bar": CAT[3], "Flagged for review": BAD_C}
+
+    # === 1. Every interaction, one square ==========================
+    # A unit chart carries the volume honestly: 9 dislikes among hundreds
+    # look like 9 among hundreds, which is the point.
+    cells = []
+    for lab in ORDER:
+        idx = outcome[outcome == lab].index
+        for i in idx:
+            cells.append((lab, bool(disliked.get(i, False))))
+    ncell = len(cells)
+    if ncell:
+        cols = int(np.ceil(np.sqrt(ncell * 3.2)))
+        rws = int(np.ceil(ncell / cols))
+        fig, ax = plt.subplots(figsize=(min(13, cols * .22 + 2),
+                                        rws * .22 + 2.3))
+        for k, (lab, dis) in enumerate(cells):
+            r, c = divmod(k, cols)
+            ax.add_patch(plt.Rectangle(
+                (c, rws - r), .86, .86, facecolor=CMAP[lab],
+                alpha=.95 if dis else .55,
+                edgecolor=INK if dis else "none",
+                linewidth=1.4 if dis else 0, zorder=3 if dis else 2))
+        ax.set_xlim(-.5, cols + .5); ax.set_ylim(-.5, rws + 1.5)
+        ax.set_aspect("equal"); ax.axis("off")
+        handles = [plt.Rectangle((0, 0), 1, 1, facecolor=CMAP[l], alpha=.55)
+                   for l in ORDER if (outcome == l).any()]
+        labels = [f"{l}  ({int((outcome == l).sum())})"
+                  for l in ORDER if (outcome == l).any()]
+        if n_dis:
+            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#ffffff",
+                                         edgecolor=INK, linewidth=1.4))
+            labels.append(f"user disliked  ({n_dis})")
+        ax.legend(handles, labels, frameon=False, ncol=min(5, len(labels)),
+                  loc="upper center", bbox_to_anchor=(.5, .06), fontsize=9)
+        n_fb = int(fb.notna().sum())
+        sub = ""
+        if n_fb:
+            in_exp = int((disliked & (outcome == "Expected behaviour")).sum())
+            liked_exp = int((fb.eq("positive")
+                             & (outcome == "Expected behaviour")).sum())
+            sub = (f"\n{n_fb} carried user feedback: {n_dis} disliked"
+                   + (f" ({in_exp} on rows the audit cleared)" if in_exp
+                      else "")
+                   + f", {int(fb.eq('positive').sum())} liked"
+                   + (f" ({liked_exp} on cleared rows)" if liked_exp else ""))
+        ax.set_title(f"Every interaction audited  —  {nfull:,} squares, "
+                     f"one per interaction{sub}")
+        _finish(fig, ax, "14_unit_chart", grid=False)
+
+    # === 2. Where the dislikes landed ==============================
+    # Counts, never rates. Below DISLIKE_CHART_MIN this is not worth its
+    # own chart — a bar of 1s and 2s invites a rate reading it cannot
+    # support — so the unit chart's subtitle carries the point instead.
+    if n_dis >= DISLIKE_CHART_MIN:
+        g = (pd.DataFrame({"outcome": outcome, "dis": disliked})
+               .groupby("outcome")["dis"].agg(["sum", "count"]))
+        g = g.reindex([l for l in ORDER if l in g.index])
+        fig, ax = plt.subplots(figsize=(9.5, max(3, .66 * len(g) + 2)))
+        y = np.arange(len(g))
+        ax.barh(y, g["count"], height=.62, color="#e8e7e2", zorder=2,
+                label="interactions")
+        ax.barh(y, g["sum"], height=.62,
+                color=[CMAP[i] for i in g.index], zorder=3,
+                label="of which disliked")
+        for i, (s, c) in enumerate(zip(g["sum"], g["count"])):
+            ax.text(c + nfull * .012, i, f"{int(s)} of {int(c)}",
+                    va="center", fontsize=10,
+                    color=BAD_C if s else INK_SOFT,
+                    fontweight="bold" if s else "normal")
+        ax.set_yticks(y, g.index)
+        ax.set_xlim(0, g["count"].max() * 1.22)
+        ax.legend(frameon=False, ncol=2, loc="upper center",
+                  bbox_to_anchor=(.5, -.16), fontsize=9)
+        top = g["sum"].idxmax() if g["sum"].max() else None
+        sub = (f"most sit in '{top}'" if top else "")
+        ax.set_title(f"Where the {n_dis} disliked interactions landed"
+                     + (f"\n{sub} — the audit called those correct"
+                        if top == "Expected behaviour" else ""))
+        _finish(fig, ax, "15_dislike_location", "interactions")
+
+    # === 3. Interrogating the cleared set ==========================
+    rc = _col("expected_reason")
+    if rc:
+        e = audit_full[m_exp].copy()
+        e["_r"] = (e[rc].fillna("").replace("", "(not recorded)")
+                   .astype(str).str.replace("_", " "))
+        e["_d"] = disliked.reindex(e.index).fillna(False)
+        g = e.groupby("_r").agg(n=("_r", "size"), dis=("_d", "sum"))
+        g = g.sort_values("n")
+        if len(g):
+            fig, ax = plt.subplots(figsize=(10, max(3, .62 * len(g) + 2)))
+            y = np.arange(len(g))
+            ax.barh(y, g["n"], height=.62, color=OK_C, alpha=.75, zorder=3)
+            ax.barh(y, g["dis"], height=.62, color=BAD_C, zorder=4)
+            for i, (n_, d_) in enumerate(zip(g["n"], g["dis"])):
+                ax.text(n_ + g["n"].max() * .02, i,
+                        f"{int(n_)}" + (f"   ({int(d_)} disliked)"
+                                        if d_ else ""),
+                        va="center", fontsize=10,
+                        color=BAD_C if d_ else INK_SOFT,
+                        fontweight="bold" if d_ else "normal")
+            ax.set_yticks(y, g.index)
+            ax.set_xlim(0, g["n"].max() * 1.3)
+            ax.set_title("Why the audit cleared these — and which "
+                         "'correct' behaviours users still disliked")
+            _finish(fig, ax, "16_cleared_reasons", "interactions")
+
+
+try:
+    build_analysis_page()
+except Exception as _e:
+    print(f"\nanalysis page skipped: {type(_e).__name__}: {_e}")
+
 # ---- 7. TABLEAU EXTRACTS ------------------------------------------------
 # quality_factors / all_causes are multi-value strings, which Tableau
 # cannot count. Build a LONG table: one row per (interaction, factor,
