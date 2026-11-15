@@ -83,82 +83,158 @@ CORPUS_GAP_TOP_N = 5
 # corroborations, lower it if genuine in-scope questions are not corroborated.
 CORPUS_MATCH_THRESHOLD = 0.25
 
+# Word and Excel emit characters that are not in UTF-8 and whitespace that
+# is not a space. Neither should cost us the corpus.
+_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+_ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"), None)
+_PUNCT = {"‘": "'", "’": "'", "‚": "'", "“": '"',
+          "”": '"', "„": '"', "–": "-", "—": "-",
+          "−": "-", " ": " ", "…": "..."}
+
+
+def clean_text(v):
+    """Flatten a CSV cell to something a prompt and a vectorizer can use.
+
+    Smart quotes, non-breaking spaces and zero-width joiners survive a copy
+    out of Word and then show up as noise in the judge's prompt and as
+    separate tokens in the match. Newlines inside a quoted cell are legal
+    CSV but wreck the one-document-per-line corpus listing.
+    """
+    s = str(v or "")
+    for a, b in _PUNCT.items():
+        s = s.replace(a, b)
+    s = s.translate(_ZERO_WIDTH)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _read_corpus_csv(path):
+    """Read the corpus CSV, trying encodings in turn and skipping bad rows."""
+    sep = "\t" if str(path).lower().endswith(".tsv") else ","
+    last = None
+    for enc in _ENCODINGS:
+        try:
+            try:
+                df = pd.read_csv(path, sep=sep, dtype=str, encoding=enc,
+                                 on_bad_lines="warn",
+                                 skip_blank_lines=True).fillna("")
+            except TypeError:                 # pandas < 1.3
+                df = pd.read_csv(path, sep=sep, dtype=str, encoding=enc,
+                                 error_bad_lines=False,
+                                 warn_bad_lines=True).fillna("")
+            if enc != "utf-8-sig":
+                print(f"  note: read as {enc} (not UTF-8). Characters may "
+                      f"have been approximated.")
+            return df
+        except UnicodeDecodeError as exc:
+            last = exc
+            continue
+    raise last
+
+
 def _load_corpus(path):
     """Corpus index -> [{title, file_name, purpose, scope, display, match_text}].
 
     Accepts a CSV with a column per field, or a plain text file of one title
-    per line. Purpose and scope matter twice over: they make the similarity
-    match far better than a title alone ("ETR" will never lexically match
-    "Environmental and Transition Risk Standard"), and they let the judge
-    decide scope from what a document actually covers instead of guessing
-    from its name.
+    per line. Content/purpose text matters twice over: it makes the
+    similarity match work on what a document COVERS rather than what it is
+    called, and it lets the judge rule on scope from a description instead
+    of from the feel of a title.
+
+    A corpus that exists but cannot be read raises. Returning an empty list
+    would let the whole run proceed with no corpus, quietly degrading every
+    scope and missing-document judgment while the output still looked
+    clean. This happens before any judge call, so failing here is free.
     """
     def pack(title, file_name="", purpose="", scope=""):
-        title = str(title or file_name or "").strip()
+        title = clean_text(title) or clean_text(file_name)
+        purpose, scope = clean_text(purpose), clean_text(scope)
         bits = [x for x in (purpose, scope) if x]
         return {
             "title": title,
-            "file_name": str(file_name or "").strip(),
-            "purpose": str(purpose or "").strip(),
-            "scope": str(scope or "").strip(),
-            "display": title + (" — " + "; ".join(bits) if bits else ""),
+            "file_name": clean_text(file_name),
+            "purpose": purpose,
+            "scope": scope,
+            "display": title + (" - " + "; ".join(bits) if bits else ""),
             # what the vectorizer sees; the title is repeated so it still
-            # dominates a long purpose paragraph
+            # dominates a long content paragraph
             "match_text": " ".join([title, title, purpose, scope]).strip(),
         }
 
-    try:
-        if str(path).lower().endswith((".csv", ".tsv")):
-            sep = "\t" if str(path).lower().endswith(".tsv") else ","
-            df  = pd.read_csv(path, sep=sep, dtype=str).fillna("")
-            cols = {re.sub(r"[^a-z]", "", c.lower()): c for c in df.columns}
-
-            def find(*names):
-                for n in names:
-                    if n in cols:
-                        return cols[n]
-                for n in names:                      # substring fallback
-                    for k, c in cols.items():
-                        if n in k:
-                            return c
-                return None
-
-            c_title = find("documenttitle", "doctitle", "title", "documentname",
-                           "policyname", "name")
-            c_file  = find("filename", "file", "document", "source", "path")
-            c_purp  = find("purpose", "content", "description", "summary",
-                           "about", "objective", "intent", "body", "text")
-            c_scope = find("scope", "applicability", "appliesto", "coverage",
-                           "geography", "region")
-            if not (c_title or c_file):
-                raise ValueError(
-                    f"no title or file-name column found in {path}. "
-                    f"columns seen: {list(df.columns)}")
-            recs = [pack(r.get(c_title, "") if c_title else "",
-                         r.get(c_file, "")  if c_file  else "",
-                         r.get(c_purp, "")  if c_purp  else "",
-                         r.get(c_scope, "") if c_scope else "")
-                    for r in df.to_dict("records")]
-            recs = [r for r in recs if r["title"]]
-            print(f"loaded {len(recs)} corpus documents from {path}")
-            print(f"  title={c_title!r} file={c_file!r} "
-                  f"purpose={c_purp!r} scope={c_scope!r}")
-            n_desc = sum(1 for r in recs if r["purpose"] or r["scope"])
-            print(f"  {n_desc}/{len(recs)} carry a purpose or scope "
-                  f"description")
-            return recs
-
-        with open(path) as fh:
-            recs = [pack(l.strip()) for l in fh if l.strip()]
-        print(f"loaded {len(recs)} corpus titles from {path}")
-        return recs
-    except FileNotFoundError:
+    if not os.path.exists(path):
         print(f"WARNING: corpus index not found at {path}. "
               f"Scope judgments will rely on topic feel only.")
         return []
-    except Exception as exc:
-        print(f"WARNING: could not read corpus index {path}: {exc}")
-        return []
+
+    if str(path).lower().endswith((".csv", ".tsv")):
+        df = _read_corpus_csv(path)
+        cols = {re.sub(r"[^a-z]", "", str(c).lower()): c for c in df.columns}
+
+        def find(*names):
+            for n in names:
+                if n in cols:
+                    return cols[n]
+            for n in names:                      # substring fallback
+                for k, c in cols.items():
+                    if n in k:
+                        return c
+            return None
+
+        c_title = find("documenttitle", "doctitle", "title", "documentname",
+                       "policyname", "name")
+        c_file  = find("filename", "file", "document", "source", "path")
+        c_purp  = find("purpose", "content", "description", "summary",
+                       "about", "objective", "intent", "body", "text")
+        c_scope = find("scope", "applicability", "appliesto", "coverage",
+                       "geography", "region")
+        if not (c_title or c_file):
+            raise ValueError(
+                f"no title or file-name column found in {path}. "
+                f"columns seen: {list(df.columns)}")
+
+        recs, blank = [], 0
+        for r in df.to_dict("records"):
+            rec = pack(r.get(c_title, "") if c_title else "",
+                       r.get(c_file, "")  if c_file  else "",
+                       r.get(c_purp, "")  if c_purp  else "",
+                       r.get(c_scope, "") if c_scope else "")
+            if not rec["title"]:
+                blank += 1
+                continue
+            recs.append(rec)
+
+        seen, dedup = set(), []
+        for rec in recs:                       # same document listed twice
+            k = rec["title"].lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(rec)
+
+        print(f"loaded {len(dedup)} corpus documents from {path}")
+        print(f"  title={c_title!r} file={c_file!r} "
+              f"purpose={c_purp!r} scope={c_scope!r}")
+        n_desc = sum(1 for r in dedup if r["purpose"] or r["scope"])
+        print(f"  {n_desc}/{len(dedup)} carry a description")
+        if n_desc < len(dedup):
+            print(f"  note: {len(dedup) - n_desc} document(s) have a name but "
+                  f"no content. Those match on title alone.")
+        if blank:
+            print(f"  skipped {blank} row(s) with no file name")
+        if len(recs) != len(dedup):
+            print(f"  skipped {len(recs) - len(dedup)} duplicate title(s)")
+        if not dedup:
+            raise ValueError(f"corpus {path} parsed to zero usable rows")
+        return dedup
+
+    for enc in _ENCODINGS:
+        try:
+            with open(path, encoding=enc) as fh:
+                recs = [pack(l.strip()) for l in fh if l.strip()]
+            print(f"loaded {len(recs)} corpus titles from {path}")
+            return recs
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"could not decode {path} in any of {_ENCODINGS}")
 
 CORPUS_INDEX = _load_corpus(CORPUS_INDEX_PATH)
 
