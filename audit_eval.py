@@ -328,6 +328,21 @@ SCOPE  = ["in_scope_rule", "in_scope_user_specific", "adjacent",
           "action_request", "chitchat", "off_topic"]
 ROUTES = ["answered", "clarified", "refused_scope", "refused_action"]
 REFUSED = ("refused_scope", "refused_action")
+# An answer that admits its own limits. Checked in code because the whole
+# point of ANSWER_UNGROUNDED is to not depend on a judge flag that
+# defaults to the agent's benefit.
+HEDGE_RE = re.compile(
+    r"not (?:available|found|covered|specified|stated|included)"
+    r"|could not (?:find|locate|identify)|unable to (?:find|locate|confirm)"
+    r"|no (?:specific |relevant )?(?:document|policy|standard|guidance|"
+    r"information)\b|do(?:es)? not (?:cover|specify|address|state)"
+    r"|may not be (?:complete|exhaustive|up to date)"
+    r"|(?:recommend|suggest|please) (?:confirm|verify|check|consult|contact)"
+    r"|based on the (?:limited|available) (?:information|documents)"
+    r"|outside the (?:available|retrieved) (?:documents|policies)",
+    re.I)
+
+
 PII    = re.compile(
     r"[\w.+-]+@[\w-]+\.[\w.]+|\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b|\b\d{12}\b")
 
@@ -372,7 +387,7 @@ CAUSE_OWNER = {
     "no_next_step_in_template":            "static response design",
     "clarified_though_chunks_resolved_it": "routing prompt",
     "clarified_on_stale_context":          "conversation memory",
-    "clarified_though_request_was_clear":  "routing prompt",
+    "clarified_though_request_was_answerable": "routing prompt",
     "clarified_with_irrelevant_question":  "routing prompt",
     "prompt_or_routing":                   "prompt / routing",
     "generation_or_communication":         "response prompt",
@@ -381,6 +396,10 @@ CAUSE_OWNER = {
 }
 
 THEME_PRIORITY = [
+    # not a defect claim: the flags did not decide, and the answer
+    # visibly missed the question, so neither "expected" nor a named
+    # defect would be honest
+    "undetermined",
     "excessive_guardrail",
     "context_continuity_failure",
     "unnecessary_clarification",
@@ -643,11 +662,25 @@ CALLS = {
         "inputs": ["corpus", "history", "request"],
         "scope": True,
         "flags": {
-            "REQUEST_IS_AMBIGUOUS": (
-                "TRUE: cannot be answered without assuming something the user did not say, "
-                "even after reading history. A topic or standard name alone is NOT ambiguous.",
-                "FALSE: answerable as stated, or history resolves what is missing, "
-                "or the request is a topic/standard name the agent can describe."),
+            "REQUEST_NOT_ANSWERABLE_AS_STATED": (
+                "TRUE: answering correctly would require a fact the user did not supply. "
+                "APPLY THIS TEST: could the correct answer DIFFER depending on something "
+                "the user left unstated? If yes, TRUE. The unstated fact may be any of: "
+                "which of several possible readings of the words was meant; which "
+                "standard, policy or document version applies; a dimension the policy "
+                "itself keys on (region, legal entity, client or product category, role, "
+                "grade, seniority, severity, tier, threshold band, channel, date or "
+                "period); or which of several named processes, limits or obligations is "
+                "in scope. Clear, well-formed English can still be TRUE - plain wording "
+                "is one way to be answerable, not the same thing as being answerable. "
+                "Judge whether the ANSWER is determined, not whether the QUESTION is "
+                "readable.",
+                "FALSE: the correct answer is the SAME whatever the user left unstated - "
+                "the rule is unconditional on it; or the history supplies the missing "
+                "fact; or the request names a topic, standard or document the agent can "
+                "simply describe or locate. Do NOT mark TRUE merely because more detail "
+                "could have been given, or because the request is broad or wordy: the "
+                "missing fact must be one that CHANGES the answer."),
             "REQUEST_IS_ADVERSARIAL": (
                 "TRUE: tries to override instructions, reveal the system prompt, or inject commands.",
                 "FALSE: otherwise."),
@@ -676,15 +709,15 @@ CALLS = {
             "'How do I cancel my leave?' -> in_scope_rule, REQUEST_IS_PROCEDURAL=TRUE",
             "'What happens if I cancel after approval?' -> in_scope_rule, REQUEST_IS_PROCEDURAL=TRUE",
             "'How many leave days do I have left?' -> in_scope_user_specific",
-            "'Wolfsberg standards' or 'CFCR regulatory change' -> in_scope_rule, REQUEST_IS_AMBIGUOUS=FALSE "
+            "'Wolfsberg standards' or 'CFCR regulatory change' -> in_scope_rule, REQUEST_NOT_ANSWERABLE_AS_STATED=FALSE "
             "(topic name is a valid request)",
             "'Where can I get the Wolfsberg document?' -> in_scope_rule, REQUEST_IS_DOCUMENT_LOCATION=TRUE",
-            "'Market risk internal capital report sign off' -> REQUEST_IS_AMBIGUOUS=TRUE "
+            "'Market risk internal capital report sign off' -> REQUEST_NOT_ANSWERABLE_AS_STATED=TRUE "
             "(could mean: what is the sign-off process, OR: sign off this report)",
             "Request is specific but corpus lacks the full document. Agent acknowledged the gap "
-            "and gave the partial rule available. -> REQUEST_IS_AMBIGUOUS=FALSE. "
+            "and gave the partial rule available. -> REQUEST_NOT_ANSWERABLE_AS_STATED=FALSE. "
             "Ambiguity is a property of the REQUEST, not of what the corpus covers.",
-            "Request covers two standards (e.g. standard A and standard B). -> REQUEST_IS_AMBIGUOUS=FALSE "
+            "Request covers two standards (e.g. standard A and standard B). -> REQUEST_NOT_ANSWERABLE_AS_STATED=FALSE "
             "if both are named clearly. A partial response covering only one is a retrieval issue, not ambiguity.",
         ],
     },
@@ -711,16 +744,17 @@ CALLS = {
                 "as stated in the request or history.",
                 "FALSE: they apply, or the user's situation is not stated."),
             "CHUNKS_RESOLVE_AMBIGUITY": (
-                "TRUE: if the request could be read more than one way, the retrieved chunks "
-                "settle which reading applies — only one of the possible topics has a policy "
-                "here, or one rule in the chunks covers every reading, so the answer would be "
-                "the same either way. You must be able to QUOTE the chunk passage that "
+                "TRUE: the request was missing a fact needed to answer it, and the "
+                "retrieved chunks SUPPLY that fact or make it irrelevant — only one of the "
+                "possible readings has a policy here, or one rule in the chunks covers "
+                "every reading, or the rule turns out to be unconditional on the missing "
+                "dimension, so the answer would be the same either way. You must be able to QUOTE the chunk passage that "
                 "settles it; if you cannot point to one, answer FALSE. This flag is a "
                 "ground for calling a clarification unnecessary, so an unsupported TRUE "
                 "wrongly blames the agent for asking.",
-                "FALSE: the chunks leave the ambiguity open — several readings each have a "
-                "different rule in the chunks — or there are no chunks. Also FALSE when the "
-                "request was never ambiguous."),
+                "FALSE: the chunks leave the gap open — the missing fact still changes "
+                "which rule applies — or there are no chunks. Also FALSE when nothing was "
+                "missing from the request in the first place."),
         },
     },
     "response": {
@@ -1604,6 +1638,16 @@ def code_flags(row, c):
         "RETRIEVAL_RETURNED_CHUNKS": b(bool(c["chunks"])),
         "RESPONSE_EXCESSIVE_LENGTH": b(len(resp) > 1200),
         "RESPONSE_EXPOSES_PII":      b(bool(PII.search(resp))),
+        # The answer asserts policy with no usable retrieval behind it and
+        # does not say so. Entirely code-derived: RETRIEVAL_RETURNED_CHUNKS
+        # is code-set and the hedge test reads the response text, so this
+        # cannot be softened by a judge flag that defaults to TRUE.
+        # It is the on-topic-but-speculating case, which every other flag
+        # misses: ANSWER_ADDRESSES_QUESTION is about topicality and says
+        # the answer is fine.
+        "ANSWER_UNGROUNDED":         b(
+            not c["chunks"] and bool(resp.strip())
+            and not HEDGE_RE.search(resp)),
         "MATERIAL_TOOL_CALL_MADE":   NA,      # no tool-call log in CSV
         "CORPUS_HAS_ANSWER":         UNKNOWN, # set only via confirmed twin
         "ANSWERED_ELSEWHERE":        NA,
@@ -1818,7 +1862,7 @@ def norm_map_lookup(response_text):
 def derive(route, f):
     d   = {}
     cat = f.get("SCOPE_CATEGORY", UNKNOWN)
-    amb = f.get("REQUEST_IS_AMBIGUOUS", UNKNOWN)
+    unanswerable = f.get("REQUEST_NOT_ANSWERABLE_AS_STATED", UNKNOWN)
     known = cat != UNKNOWN
 
     d["REQUEST_IN_POLICY_SCOPE"]       = b(cat in INSCOPE) if known else UNKNOWN
@@ -1832,9 +1876,9 @@ def derive(route, f):
         expected = "refused_action"
     elif cat not in INSCOPE:
         expected = "refused_scope"
-    elif amb == TRUE:
+    elif unanswerable == TRUE:
         expected = "clarified"
-    elif amb == UNKNOWN:
+    elif unanswerable == UNKNOWN:
         expected = UNKNOWN
     else:
         expected = "answered"
@@ -1886,7 +1930,7 @@ def derive(route, f):
         else b(route == "refused_action"
                and cat in INSCOPE
                and f.get("REQUEST_IS_PROCEDURAL") == TRUE
-               and f.get("REQUEST_IS_AMBIGUOUS") != TRUE))
+               and f.get("REQUEST_NOT_ANSWERABLE_AS_STATED") != TRUE))
 
     d["GUARDRAIL_FALSE_PASS"] = (
         UNKNOWN if unk
@@ -1911,7 +1955,7 @@ def clarification_sources(route, f):
     if route != "clarified":
         return "", ""
     clear, unclear = [], []
-    (clear if f.get("REQUEST_IS_AMBIGUOUS") == FALSE
+    (clear if f.get("REQUEST_NOT_ANSWERABLE_AS_STATED") == FALSE
      else unclear).append("request")
     (clear if f.get("HISTORY_HAS_NEEDED_INFO") == TRUE
      else unclear).append("history")
@@ -1935,7 +1979,7 @@ def expected_behavior(route, f, static):
     """
     cat      = f.get("SCOPE_CATEGORY")
     in_scope = f.get("REQUEST_IN_POLICY_SCOPE")
-    amb      = f.get("REQUEST_IS_AMBIGUOUS")
+    unanswerable = f.get("REQUEST_NOT_ANSWERABLE_AS_STATED")
     ack      = f.get("ANSWER_ACKNOWLEDGES_LIMITATION")
 
     # 1. Out of scope -> static refusal. The template IS the designed response.
@@ -1959,7 +2003,7 @@ def expected_behavior(route, f, static):
 
     # 5. Clarification is correct only when ALL THREE sources were unclear:
     #    the request itself, the history, and the retrieved chunks.
-    if (route == "clarified" and amb == TRUE
+    if (route == "clarified" and unanswerable == TRUE
             and f.get("HISTORY_HAS_NEEDED_INFO") != TRUE
             and f.get("CHUNKS_RESOLVE_AMBIGUITY") != TRUE
             and f.get("REQUEST_IS_TOPIC_CHANGE") != TRUE
@@ -1968,7 +2012,7 @@ def expected_behavior(route, f, static):
 
     # 6. Ambiguous request that could be read as an action -> cautious refusal
     #    is defensible. The agent cannot be faulted for not guessing.
-    if (amb == TRUE and route == "refused_action"
+    if (unanswerable == TRUE and route == "refused_action"
             and f.get("REQUEST_IS_PROCEDURAL") != TRUE):
         return True, "ambiguous_action_refused_cautiously"
 
@@ -2041,8 +2085,8 @@ def themes_for(route, f):
     if route == "clarified" and f.get("RESPONSE_HAS_CLARIFY_MARKER") == TRUE:
         resolved_by = []
         # ground (a): the answer was already available to the agent
-        if f.get("REQUEST_IS_AMBIGUOUS") == FALSE:
-            resolved_by.append("request_was_clear")
+        if f.get("REQUEST_NOT_ANSWERABLE_AS_STATED") == FALSE:
+            resolved_by.append("request_was_answerable")
         if f.get("HISTORY_HAS_NEEDED_INFO") == TRUE:
             resolved_by.append("history_had_it")
         if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
@@ -2066,7 +2110,7 @@ def themes_for(route, f):
     # Ambiguous user context: only when agent answered despite ambiguity
     # OR when it asked a vague clarification. NOT when it correctly clarified.
     # NOT when the agent acknowledged a limitation (that is a corpus gap, not ambiguity).
-    if (f.get("REQUEST_IS_AMBIGUOUS") == TRUE
+    if (f.get("REQUEST_NOT_ANSWERABLE_AS_STATED") == TRUE
             and f.get("ANSWER_ACKNOWLEDGES_LIMITATION") != TRUE
             and (route == "answered"
                  or f.get("CLARIFICATION_VAGUE") == TRUE)):
@@ -2075,7 +2119,7 @@ def themes_for(route, f):
     # Ambiguous action-or-question: when both ambiguity and action false-block
     # fire, treat as ambiguity, not excessive guardrail (agent was right to be cautious)
     if ("excessive_guardrail" in th
-            and f.get("REQUEST_IS_AMBIGUOUS") == TRUE
+            and f.get("REQUEST_NOT_ANSWERABLE_AS_STATED") == TRUE
             and f.get("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE):
         th.remove("excessive_guardrail")
         if "ambiguous_user_context" not in th:
@@ -2142,132 +2186,19 @@ def gap_type_for(route, f):
 
 
 def root_cause_for(route, f, themes):
-    """Earliest failing stage wins."""
+    """Primary cause: the earliest failing stage. Same table as the rest.
+
+    themes is accepted for call-site compatibility and used only as a
+    gate - an expected-behaviour row has no themes and no cause. The cause
+    itself comes from the flags.
+    """
     if not themes:
         return None
-    cat = f.get("SCOPE_CATEGORY")
-
-    # 1. request understanding
-    if (f.get("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE
-            and f.get("REQUEST_IS_PROCEDURAL") == TRUE
-            and f.get("REQUEST_IS_AMBIGUOUS") != TRUE):
-        return {"stage": "request_understanding",
-                "cause": "intent_misread_action_detector"}
-    if "intent_misinterpretation" in themes:
-        return {"stage": "request_understanding", "cause": "intent_misread"}
-    if "ambiguous_user_context" in themes:
-        return {"stage": "request_understanding", "cause": "ambiguity_missed"}
-
-    # 2. context use
-    if (f.get("HISTORY_HAS_NEEDED_INFO") == TRUE
-            and route in ("clarified",) + REFUSED):
-        return {"stage": "context_use", "cause": "context_continuity_failure"}
-
-    # 3. retrieval
-    # An unnecessary clarification fires because one of the three sources was
-    # CLEAR. A retrieval weakness therefore cannot be what made it
-    # unnecessary, so retrieval does not get to claim this theme — doing so
-    # produced causes like "retrieval_partial_coverage" on rows where the
-    # agent simply asked a question it did not need to ask.
-    clarification_only = (
-        "unnecessary_clarification" in themes
-        and not any(t in themes for t in
-                    ("partial_answer", "intent_misinterpretation",
-                     "excessive_guardrail")))
-
-    retrieval_bad = (
-        not clarification_only
-        and f.get("RETRIEVAL_RETURNED_CHUNKS") == TRUE
-        and (f.get("AUDIT_INPUT_LIMITED") == TRUE
-             or f.get("CHUNKS_ON_TOPIC") == FALSE
-             or f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE))
-    if retrieval_bad:
-        if f.get("CHUNKS_WRONG_APPLICABILITY") == TRUE:
-            return {"stage": "retrieval",
-                    "cause": "retrieval_applicability_miss"}
-        if f.get("CHUNKS_CONFLICT") == TRUE:
-            return {"stage": "retrieval", "cause": "retrieval_conflict"}
-        if f.get("CHUNKS_PARTIAL_COVERAGE") == TRUE:
-            return {"stage": "retrieval",
-                    "cause": "retrieval_partial_coverage"}
-        if f.get("CORPUS_HAS_ANSWER") == TRUE:
-            return {"stage": "retrieval", "cause": "retrieval_precision_miss"}
-        if f.get("CORPUS_HAS_ANSWER") == FALSE:
-            return {"stage": "retrieval", "cause": "retrieval_coverage_gap"}
-        return {"stage": "retrieval", "cause": "undetermined"}
-
-    # corpus gap acknowledged correctly: not a failure, but record it
-    if (f.get("AUDIT_INPUT_LIMITED") == TRUE
-            and f.get("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE):
-        return {"stage": "retrieval",
-                "cause": "acknowledged_limitation_correctly"}
-
-    # 4. decision — clarification first, so its own causes are reachable.
-    # These must come BEFORE the guardrail block: that block also matched
-    # unnecessary_clarification and returned guardrail-flavoured causes,
-    # which made every cause below it dead code.
-    if "unnecessary_clarification" in themes:
-        # asking about a dimension the answer does not turn on is a
-        # different defect from asking about one already supplied: the
-        # first is the routing prompt choosing the wrong question, the
-        # second is it failing to read what it already had
-        if f.get("CLARIFY_QUESTION_DIVERTS") == TRUE:
-            return {"stage": "decision",
-                    "cause": "clarified_with_irrelevant_question"}
-        if f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
-            return {"stage": "decision",
-                    "cause": "clarified_though_chunks_resolved_it"}
-        if f.get("REQUEST_IS_TOPIC_CHANGE") == TRUE:
-            return {"stage": "request_understanding",
-                    "cause": "clarified_on_stale_context"}
-        return {"stage": "decision",
-                "cause": "clarified_though_request_was_clear"}
-
-    if "excessive_guardrail" in themes:
-        if f.get("CORPUS_HAS_ANSWER") == TRUE:
-            return {"stage": "decision",
-                    "cause": "guardrail_blocked_answerable"}
-        if f.get("REQUEST_IS_DOCUMENT_LOCATION") == TRUE:
-            return {"stage": "decision",
-                    "cause": "guardrail_refused_policy_question"}
-        if cat == "adjacent":
-            return {"stage": "decision",
-                    "cause": "scope_definition_too_narrow"}
-        if cat == "in_scope_user_specific":
-            return {"stage": "decision",
-                    "cause": "refused_answerable_generally"}
-        return {"stage": "decision", "cause": "prompt_or_routing"}
-
-    if "incomplete_next_step_guidance" in themes:
-        return {"stage": "decision", "cause": "no_next_step_in_template"}
-
-    if "partial_answer" in themes:
-        return {"stage": "retrieval", "cause": "retrieval_partial_coverage"}
-
-    # 5. generation / communication
-    if themes == ["communication_quality"]:
-        return {"stage": "generation",
-                "cause": "generation_or_communication"}
-
-    return {"stage": "generation", "cause": "generation_or_communication"}
-
-
-# COMMAND ----------
-# --------------------------------------------------------------------------
-# VALIDATOR
-# --------------------------------------------------------------------------
-_STOPWORDS = {
-    "there", "their", "which", "where", "these", "those", "about", "other",
-    "would", "could", "should", "being", "having", "shall", "while", "until",
-    "still", "remain", "remains", "available", "accessible", "documents",
-    "document", "policy", "policies", "procedure", "procedures",
-}
-
-
-_NEG_RE = re.compile(
-    r"\b(?:not|no|never|cannot|can't|don't|doesn't|isn't|aren't|won't|"
-    r"without|exempt|excluded|prohibited|ineligible|need not|unnecessary)\b",
-    re.I)
+    hits = causes_from_flags(f, route, f.get("SCOPE_CATEGORY"))
+    if not hits:
+        return None
+    stage, cause = hits[0]           # already in STAGE_ORDER
+    return {"stage": stage, "cause": cause}
 
 
 def ev_fields(entry):
@@ -2429,6 +2360,7 @@ FLAG_POLARITY = {
     "ANSWER_OMITS_CONDITION_OR_EXCEPTION": ("defect", FALSE),
     "ANSWER_HAS_UNSUPPORTED_CLAIM":        ("defect", FALSE),
     "ANSWER_NUMBERS_UNSUPPORTED":          ("defect", FALSE),
+    "ANSWER_UNGROUNDED":                   ("defect", FALSE),
     "ANSWERED_WITH_SILENT_ASSUMPTION":     ("defect", FALSE),
     "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY": ("defect", FALSE),
     "ACTION_CLAIMED_PERFORMED":            ("defect", FALSE),
@@ -2445,11 +2377,11 @@ FLAG_POLARITY = {
     # ---- condition: a fact about the inputs ---------------------------
     # Each of these has a definition whose FALSE branch is explicitly the
     # default case, so FALSE is what "I could not tell" must mean. Two of
-    # them can ground a finding either way - REQUEST_IS_AMBIGUOUS and
+    # them can ground a finding either way - REQUEST_NOT_ANSWERABLE_AS_STATED and
     # REQUEST_IS_TOPIC_CHANGE - and FALSE is still right: it says "this
     # request is ordinary and continues the thread", which is the claim
     # that assumes least.
-    "REQUEST_IS_AMBIGUOUS":                ("condition", FALSE),
+    "REQUEST_NOT_ANSWERABLE_AS_STATED":                ("condition", FALSE),
     "REQUEST_IS_TOPIC_CHANGE":             ("condition", FALSE),
     "REQUEST_IS_PROCEDURAL":               ("condition", FALSE),
     "REQUEST_IS_DOCUMENT_LOCATION":        ("condition", FALSE),
@@ -2858,6 +2790,17 @@ def verdict(f, issues, errors, themes, is_expected=False):
                 "soft"        if soft     else
                 "expected"    if is_expected else
                 "clean")
+    # An undetermined row must surface. Its driving flag is
+    # ANSWER_ADDRESSES_QUESTION=FALSE, which no flag-list above catches
+    # because they all test "== TRUE", so without this it would be
+    # reported as clean - the opposite of what undetermined means.
+    if "undetermined" in (themes or []):
+        reasons = reasons + ["undetermined: the answer does not address the "
+                             "question and no cause could be derived from "
+                             "the decided flags"]
+        needs = True
+        tier  = "undetermined"
+
     low      = [x for x in LOW_PRIORITY if f.get(x) == TRUE]
     msg      = (("Needs review: " + "; ".join(reasons)) if needs
                 else ("Clean (soft: " + "; ".join(soft) + ")" if soft
@@ -2991,6 +2934,36 @@ def finish(st):
     else:
         themes = themes_for(route, f)
         cause  = root_cause_for(route, f, themes)
+
+        # A theme with no derivable cause means the flags it rested on
+        # came back undecided - the cause rules only fire on an explicit
+        # match, so an UNKNOWN produces nothing rather than a guess.
+        # Treat that as expected behaviour rather than as an accusation we
+        # cannot substantiate.
+        #
+        # One exception: a blatantly missed question. That one needs no
+        # chunk analysis and no judgement about retrieval - you read the
+        # request, you read the answer, and they are about different
+        # things. It is not expected behaviour even when we cannot say
+        # why it happened, so it is marked undetermined instead.
+        if themes and not cause:
+            blatant = (route == "answered"
+                       and f.get("ANSWER_ADDRESSES_QUESTION") == FALSE)
+            if blatant:
+                themes = ["undetermined"]
+                cause  = {"stage": "undetermined",
+                          "cause": "undetermined_missed_question"}
+                demoted.append(
+                    "no cause derivable from the flags, but the answer does "
+                    "not address the question - marked undetermined, not "
+                    "expected behaviour")
+            else:
+                is_expected    = True
+                expected_label = "no_cause_derivable_from_decided_flags"
+                themes, cause  = [], None
+                demoted.append(
+                    "no cause derivable from the flags (undecided inputs) - "
+                    "treated as expected behaviour")
 
     gap    = gap_type_for(route, f)
     clear_src, unclear_src = clarification_sources(route, f)
@@ -3272,6 +3245,212 @@ def run_audit(path, resume=True):
 STAGE_ORDER = ["request_understanding", "context_use", "retrieval",
                "decision", "generation"]
 
+
+# ==========================================================================
+# CAUSES - a declarative table over FLAGS ONLY
+# ==========================================================================
+# Each cause is a PATTERN. It names the few flags it depends on; every
+# flag it does not name is a don't-care. A required value of UNKNOWN also
+# means don't-care, so a condition can be written out in full and the
+# irrelevant slots left as UNKNOWN.
+#
+# Two properties fall out of this, and both were problems before:
+#
+#   UNKNOWN cannot misfire. A rule only fires on an explicit match, so an
+#   undecided flag fails to match and the cause stays silent. The old
+#   if/elif chains tested "!= TRUE", which an UNKNOWN satisfied, so an
+#   undecided flag could switch a cause ON.
+#
+#   No cause depends on a theme. Causes previously read the theme list, so
+#   a theme-naming decision silently changed the causes, and a theme that
+#   did not fire took its causes down with it. Themes and causes are now
+#   two independent readings of the same flags.
+#
+# Order in this table is documentation only: every rule is evaluated, and
+# the primary cause is chosen afterwards by earliest failing stage.
+CAUSE_RULES = [
+    # ---- request understanding -------------------------------------
+    {"cause": "intent_misread_action_detector",
+     "stage": "request_understanding",
+     "when": {"ACTION_GUARDRAIL_FALSE_BLOCK": TRUE,
+              "REQUEST_IS_PROCEDURAL": TRUE,
+              "REQUEST_NOT_ANSWERABLE_AS_STATED": FALSE}},
+
+    # Intent misread requires that the request DETERMINED an answer. If it
+    # did not, the agent picked one of several legitimate readings, which
+    # is a silent assumption, not a misreading - there was no single
+    # intent to miss.
+    {"cause": "intent_misread",
+     "stage": "request_understanding",
+     "route": ("answered",),
+     "when": {"ANSWER_ADDRESSES_QUESTION": FALSE,
+              "REQUEST_NOT_ANSWERABLE_AS_STATED": FALSE}},
+
+    {"cause": "ambiguity_missed",
+     "stage": "request_understanding",
+     "route": ("answered",),
+     "when": {"REQUEST_NOT_ANSWERABLE_AS_STATED": TRUE,
+              "ANSWER_ACKNOWLEDGES_LIMITATION": FALSE}},
+    {"cause": "ambiguity_missed",
+     "stage": "request_understanding",
+     "when": {"REQUEST_NOT_ANSWERABLE_AS_STATED": TRUE,
+              "ANSWER_ACKNOWLEDGES_LIMITATION": FALSE,
+              "CLARIFICATION_VAGUE": TRUE}},
+
+    {"cause": "clarified_on_stale_context",
+     "stage": "request_understanding",
+     "route": ("clarified",),
+     "when": {"REQUEST_IS_TOPIC_CHANGE": TRUE}},
+
+    # ---- context use -----------------------------------------------
+    {"cause": "context_continuity_failure",
+     "stage": "context_use",
+     "route": ("clarified", "refused_scope", "refused_action"),
+     "when": {"HISTORY_HAS_NEEDED_INFO": TRUE}},
+
+    # ---- retrieval --------------------------------------------------
+    # Restricted to routes where retrieval shaped the OUTPUT. A pure
+    # unnecessary-clarification fires because some source was CLEAR, so
+    # retrieval is not what caused it - attaching a retrieval cause there
+    # was the "how is partial coverage a cause of clarification" problem.
+    {"cause": "retrieval_applicability_miss", "stage": "retrieval",
+     "route": ("answered",) + REFUSED,
+     "when": {"RETRIEVAL_RETURNED_CHUNKS": TRUE,
+              "CHUNKS_WRONG_APPLICABILITY": TRUE}},
+    {"cause": "retrieval_conflict", "stage": "retrieval",
+     "route": ("answered",) + REFUSED,
+     "when": {"RETRIEVAL_RETURNED_CHUNKS": TRUE, "CHUNKS_CONFLICT": TRUE}},
+    {"cause": "retrieval_partial_coverage", "stage": "retrieval",
+     "route": ("answered",) + REFUSED,
+     "when": {"RETRIEVAL_RETURNED_CHUNKS": TRUE,
+              "CHUNKS_PARTIAL_COVERAGE": TRUE}},
+    {"cause": "retrieval_precision_miss", "stage": "retrieval",
+     "route": ("answered",) + REFUSED,
+     "when": {"RETRIEVAL_RETURNED_CHUNKS": TRUE, "CHUNKS_ON_TOPIC": FALSE,
+              "CORPUS_HAS_ANSWER": TRUE}},
+    {"cause": "retrieval_coverage_gap", "stage": "retrieval",
+     "route": ("answered",) + REFUSED,
+     "when": {"AUDIT_INPUT_LIMITED": TRUE, "CORPUS_HAS_ANSWER": FALSE}},
+    {"cause": "corpus_missing_document", "stage": "retrieval",
+     "route": ("answered",) + REFUSED,
+     "when": {"RETRIEVAL_RETURNED_CHUNKS": FALSE,
+              "CORPUS_HAS_ANSWER": FALSE,
+              "REQUEST_IN_POLICY_SCOPE": TRUE}},
+    {"cause": "acknowledged_limitation_correctly", "stage": "retrieval",
+     "when": {"AUDIT_INPUT_LIMITED": TRUE,
+              "ANSWER_ACKNOWLEDGES_LIMITATION": TRUE}},
+
+    # ---- decision ---------------------------------------------------
+    {"cause": "clarified_with_irrelevant_question", "stage": "decision",
+     "route": ("clarified",),
+     "when": {"RESPONSE_HAS_CLARIFY_MARKER": TRUE,
+              "CLARIFY_QUESTION_DIVERTS": TRUE}},
+    {"cause": "clarified_though_chunks_resolved_it", "stage": "decision",
+     "route": ("clarified",),
+     "when": {"RESPONSE_HAS_CLARIFY_MARKER": TRUE,
+              "CHUNKS_RESOLVE_AMBIGUITY": TRUE}},
+    {"cause": "clarified_though_request_was_answerable", "stage": "decision",
+     "route": ("clarified",),
+     "when": {"RESPONSE_HAS_CLARIFY_MARKER": TRUE,
+              "REQUEST_NOT_ANSWERABLE_AS_STATED": FALSE}},
+
+    {"cause": "guardrail_blocked_answerable", "stage": "decision",
+     "route": REFUSED,
+     "any_of": [{"GUARDRAIL_FALSE_BLOCK": TRUE},
+                {"ACTION_GUARDRAIL_FALSE_BLOCK": TRUE}],
+     "when": {"CORPUS_HAS_ANSWER": TRUE}},
+    {"cause": "guardrail_refused_policy_question", "stage": "decision",
+     "route": REFUSED,
+     "any_of": [{"GUARDRAIL_FALSE_BLOCK": TRUE},
+                {"ACTION_GUARDRAIL_FALSE_BLOCK": TRUE}],
+     "when": {"REQUEST_IS_DOCUMENT_LOCATION": TRUE}},
+    {"cause": "scope_definition_too_narrow", "stage": "decision",
+     "route": REFUSED, "scope": ("adjacent",),
+     "any_of": [{"GUARDRAIL_FALSE_BLOCK": TRUE},
+                {"ACTION_GUARDRAIL_FALSE_BLOCK": TRUE}]},
+    {"cause": "refused_answerable_generally", "stage": "decision",
+     "route": REFUSED, "scope": ("in_scope_user_specific",),
+     "any_of": [{"GUARDRAIL_FALSE_BLOCK": TRUE},
+                {"ACTION_GUARDRAIL_FALSE_BLOCK": TRUE}]},
+
+    {"cause": "no_next_step_in_template", "stage": "decision",
+     "route": REFUSED,
+     "when": {"NEXT_STEP_PROVIDED": FALSE, "REQUEST_IN_POLICY_SCOPE": TRUE}},
+
+    # ---- generation -------------------------------------------------
+    {"cause": "answer_misread_table", "stage": "generation",
+     "route": ("answered",), "when": {"ANSWER_MISREADS_TABLE": TRUE}},
+    {"cause": "answer_contradicts_source", "stage": "generation",
+     "route": ("answered",), "when": {"ANSWER_CONTRADICTS_CHUNKS": TRUE}},
+    {"cause": "answer_incomplete", "stage": "generation",
+     "route": ("answered",), "when": {"ANSWER_COVERS_ALL_PARTS": FALSE}},
+    {"cause": "answer_ungrounded", "stage": "generation",
+     "route": ("answered",), "when": {"ANSWER_UNGROUNDED": TRUE}},
+    {"cause": "answer_unsupported_claim", "stage": "generation",
+     "route": ("answered",), "when": {"ANSWER_HAS_UNSUPPORTED_CLAIM": TRUE}},
+]
+
+# Fallbacks fire only when nothing better was found. They name a stage to
+# avoid pretending to more precision than we have.
+CAUSE_FALLBACKS = [
+    {"cause": "prompt_or_routing", "stage": "decision",
+     "route": REFUSED,
+     "any_of": [{"GUARDRAIL_FALSE_BLOCK": TRUE},
+                {"ACTION_GUARDRAIL_FALSE_BLOCK": TRUE}],
+     "unless_stage": "decision"},
+    {"cause": "generation_or_communication", "stage": "generation",
+     "any_of": [{x: TRUE} for x in LOW_PRIORITY],
+     "unless_any": True},
+]
+
+
+def _matches(rule, flags, route, scope):
+    """Does this row match the rule's pattern?
+
+    Only the flags the rule names are consulted. A required value of
+    UNKNOWN is treated as "do not care", so an undecided flag never
+    satisfies a requirement by accident.
+    """
+    if rule.get("route") and route not in rule["route"]:
+        return False
+    if rule.get("scope") and scope not in rule["scope"]:
+        return False
+    for flag, want in (rule.get("when") or {}).items():
+        if want == UNKNOWN:
+            continue
+        if flags.get(flag) != want:
+            return False
+    alts = rule.get("any_of")
+    if alts and not any(
+            all(flags.get(k) == v for k, v in alt.items()) for alt in alts):
+        return False
+    return True
+
+
+def causes_from_flags(flags, route, scope=None):
+    """Every cause that holds, from the flags alone. [(stage, cause)]."""
+    hits = []
+    for rule in CAUSE_RULES:
+        if _matches(rule, flags, route, scope):
+            hits.append((rule["stage"], rule["cause"]))
+
+    stages_hit = {s for s, _ in hits}
+    for rule in CAUSE_FALLBACKS:
+        if rule.get("unless_stage") in stages_hit:
+            continue
+        if rule.get("unless_any") and hits:
+            continue
+        if _matches(rule, flags, route, scope):
+            hits.append((rule["stage"], rule["cause"]))
+
+    seen, ordered = set(), []
+    for stage in STAGE_ORDER:
+        for s, c in hits:
+            if s == stage and c not in seen:
+                seen.add(c)
+                ordered.append((s, c))
+    return ordered
+
 CAUSE_OWNER_EXPANDED = {
     "intent_misread_action_detector":      "intent detection",
     "intent_misread":                      "intent detection / prompt",
@@ -3289,7 +3468,7 @@ CAUSE_OWNER_EXPANDED = {
     "scope_definition_too_narrow":         "guardrail / scope definition",
     "refused_answerable_generally":        "guardrail / prompt",
     "clarified_though_chunks_resolved_it": "routing prompt",
-    "clarified_though_request_was_clear":  "routing prompt",
+    "clarified_though_request_was_answerable": "routing prompt",
     "clarified_with_irrelevant_question":  "routing prompt",
     "clarified_with_irrelevant_question":  "routing prompt",
     "no_next_step_in_template":            "static response design",
@@ -3298,117 +3477,24 @@ CAUSE_OWNER_EXPANDED = {
     "answer_misread_table":                "response prompt",
     "answer_contradicts_source":           "response prompt",
     "answer_incomplete":                   "response prompt / retriever",
+    "undetermined_missed_question":        "needs human review",
+    "answer_ungrounded":                   "generation / retrieval",
+    "answer_unsupported_claim":            "generation",
+    "corpus_missing_document":             "corpus",
 }
 
 
 def all_causes_for(r):
-    """Every cause that holds for this row, not just the earliest.
+    """Every cause that holds for this row. Adapter over CAUSE_RULES.
 
-    r is a dict-like row with flag_* keys. Returns a list of
-    (stage, cause) pairs in stage order.
+    r is a dict-like row with flag_* keys. Takes no themes: the causes are
+    derived from the flags alone, so a theme never silently changes them.
     """
-    def f(name):
-        return r.get(f"flag_{name}")
-
-    themes = str(r.get("themes") or "")
-    route  = str(r.get("route") or "")
-    cat    = r.get("scope_category")
-    out    = []
-
-    # ---- 1. request understanding ----------------------------------
-    if (f("ACTION_GUARDRAIL_FALSE_BLOCK") == TRUE
-            and f("REQUEST_IS_PROCEDURAL") == TRUE
-            and f("REQUEST_IS_AMBIGUOUS") != TRUE):
-        out.append(("request_understanding", "intent_misread_action_detector"))
-    if "intent_misinterpretation" in themes:
-        out.append(("request_understanding", "intent_misread"))
-    if "ambiguous_user_context" in themes:
-        out.append(("request_understanding", "ambiguity_missed"))
-    if (route == "clarified" and f("REQUEST_IS_TOPIC_CHANGE") == TRUE):
-        out.append(("request_understanding", "clarified_on_stale_context"))
-
-    # ---- 2. context use --------------------------------------------
-    if (f("HISTORY_HAS_NEEDED_INFO") == TRUE
-            and route in ("clarified", "refused_scope", "refused_action")):
-        out.append(("context_use", "context_continuity_failure"))
-
-    # ---- 3. retrieval ----------------------------------------------
-    # Only counts when chunks were actually retrieved and something about
-    # them was wrong. A clarification is never caused by retrieval alone —
-    # it fires because a source was CLEAR — so that case is excluded.
-    chunks_bad = (
-        f("RETRIEVAL_RETURNED_CHUNKS") == TRUE
-        and (f("AUDIT_INPUT_LIMITED") == TRUE
-             or f("CHUNKS_ON_TOPIC") == FALSE
-             or f("CHUNKS_PARTIAL_COVERAGE") == TRUE))
-    clarification_only = (
-        "unnecessary_clarification" in themes
-        and not any(t in themes for t in ("partial_answer",
-                                          "intent_misinterpretation",
-                                          "excessive_guardrail")))
-    if chunks_bad and not clarification_only:
-        if f("CHUNKS_WRONG_APPLICABILITY") == TRUE:
-            out.append(("retrieval", "retrieval_applicability_miss"))
-        if f("CHUNKS_CONFLICT") == TRUE:
-            out.append(("retrieval", "retrieval_conflict"))
-        if f("CHUNKS_PARTIAL_COVERAGE") == TRUE:
-            out.append(("retrieval", "retrieval_partial_coverage"))
-        if f("CORPUS_HAS_ANSWER") == TRUE:
-            out.append(("retrieval", "retrieval_precision_miss"))
-        elif f("CORPUS_HAS_ANSWER") == FALSE:
-            out.append(("retrieval", "retrieval_coverage_gap"))
-    if (f("AUDIT_INPUT_LIMITED") == TRUE
-            and f("ANSWER_ACKNOWLEDGES_LIMITATION") == TRUE):
-        out.append(("retrieval", "acknowledged_limitation_correctly"))
-
-    # ---- 4. decision ------------------------------------------------
-    if "unnecessary_clarification" in themes:
-        if f("CLARIFY_QUESTION_DIVERTS") == TRUE:
-            out.append(("decision", "clarified_with_irrelevant_question"))
-        if f("CHUNKS_RESOLVE_AMBIGUITY") == TRUE:
-            out.append(("decision", "clarified_though_chunks_resolved_it"))
-        elif (f("REQUEST_IS_TOPIC_CHANGE") != TRUE
-                and f("CLARIFY_QUESTION_DIVERTS") != TRUE):
-            out.append(("decision", "clarified_though_request_was_clear"))
-
-    if "excessive_guardrail" in themes:
-        if f("CORPUS_HAS_ANSWER") == TRUE:
-            out.append(("decision", "guardrail_blocked_answerable"))
-        if f("REQUEST_IS_DOCUMENT_LOCATION") == TRUE:
-            out.append(("decision", "guardrail_refused_policy_question"))
-        if cat == "adjacent":
-            out.append(("decision", "scope_definition_too_narrow"))
-        if cat == "in_scope_user_specific":
-            out.append(("decision", "refused_answerable_generally"))
-        if not any(c for _, c in out if c.startswith(
-                ("guardrail_", "scope_definition", "refused_answerable"))):
-            out.append(("decision", "prompt_or_routing"))
-
-    if "incomplete_next_step_guidance" in themes:
-        out.append(("decision", "no_next_step_in_template"))
-
-    # ---- 5. generation ----------------------------------------------
-    # Only an ANSWER can be a defective answer. On a clarified or refused
-    # row there is nothing for these to describe, and without the guard a
-    # clarification picks up "answer_incomplete" as its cause.
-    if route == "answered":
-        if f("ANSWER_MISREADS_TABLE") == TRUE:
-            out.append(("generation", "answer_misread_table"))
-        if f("ANSWER_CONTRADICTS_CHUNKS") == TRUE:
-            out.append(("generation", "answer_contradicts_source"))
-        if f("ANSWER_COVERS_ALL_PARTS") == FALSE:
-            out.append(("generation", "answer_incomplete"))
-    if "communication_quality" in themes and not out:
-        out.append(("generation", "generation_or_communication"))
-
-    # de-duplicate, keep stage order
-    seen, ordered = set(), []
-    for stage in STAGE_ORDER:
-        for s, c in out:
-            if s == stage and c not in seen:
-                seen.add(c)
-                ordered.append((s, c))
-    return ordered
+    flags = {k[5:]: v for k, v in r.items()
+             if isinstance(k, str) and k.startswith("flag_")}
+    return causes_from_flags(flags,
+                             str(r.get("route") or ""),
+                             r.get("scope_category"))
 
 
 def expand_causes(df):
@@ -3567,6 +3653,9 @@ def factors_for(r):
         "ANSWER_HAS_UNSUPPORTED_CLAIM",
         "ANSWER_NUMBERS_UNSUPPORTED",
         "ANSWERED_WITH_SILENT_ASSUMPTION",
+        # an answer with no retrieval behind it is the purest form of
+        # unsubstantiated: there is no source to be unsupported BY
+        "ANSWER_UNGROUNDED",
     ])
 
     return [(fa, st, dr) for fa in FACTORS
