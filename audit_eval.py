@@ -595,6 +595,19 @@ source_states is "no chunk states this".
 If you cannot write both statements completely, you have not found a
 problem you can prove — answer FALSE.
 
+THREE DECISIONS, NOT TWO. UNKNOWN is a real answer and you must use it
+when the evidence is genuinely mixed or ambiguous — when the text supports
+both readings, or when deciding would need information you were not given.
+Do NOT force a TRUE or a FALSE to avoid saying UNKNOWN. An UNKNOWN with a
+one-line reason is more useful than a confident answer that is wrong half
+the time. Use FALSE when you can see there is no problem; use UNKNOWN when
+you cannot see.
+
+Three flags do NOT accept UNKNOWN — ANSWER_ADDRESSES_QUESTION,
+ANSWER_ACKNOWLEDGES_LIMITATION and CHUNKS_ON_TOPIC. For those, decide
+TRUE or FALSE. They are read as "the agent did this correctly", so an
+UNKNOWN would be recorded as a fault rather than as uncertainty.
+
 - "quote" is for checking only. It may be a fragment. The two statements
   must stand without it.
 - No preamble, no markdown fences, no trailing commentary. JSON object only.
@@ -701,7 +714,10 @@ CALLS = {
                 "TRUE: if the request could be read more than one way, the retrieved chunks "
                 "settle which reading applies — only one of the possible topics has a policy "
                 "here, or one rule in the chunks covers every reading, so the answer would be "
-                "the same either way.",
+                "the same either way. You must be able to QUOTE the chunk passage that "
+                "settles it; if you cannot point to one, answer FALSE. This flag is a "
+                "ground for calling a clarification unnecessary, so an unsupported TRUE "
+                "wrongly blames the agent for asking.",
                 "FALSE: the chunks leave the ambiguity open — several readings each have a "
                 "different rule in the chunks — or there are no chunks. Also FALSE when the "
                 "request was never ambiguous."),
@@ -1191,51 +1207,62 @@ CLARIFY_MARKERS = [
 CLARIFY_EXPECTED_QUESTIONS = 3
 CLARIFY_EXPECTED_OPTIONS   = 3
 
-_OPTION_LINE = re.compile(
-    r"^\s*(?:[-*•●]|\(?[a-dA-D][\).]|\(?[1-9][\).]|option\s*[1-9a-dA-D]\s*[:.\)])\s*(.+)$",
-    re.I)
-_QUESTION_LINE = re.compile(
-    r"^\s*(?:[-*\u2022\u25cf]\s*|\(?\d+[\).]\s*)?(.*\?)\s*$")
+# The live template looks like this:
+#
+#   1. Question ?
+#
+#   option a: ...
+#   option b: ...
+#   option c: ...
+#
+# So a NUMBERED line is a question and an "option x:" line is an option.
+# That ordering matters: the earlier parser treated any "1." as a possible
+# option marker, so a question whose text did not end in "?" was consumed
+# as an option and the question list came back empty.
+_Q_LINE = re.compile(r"^\s*(?:\(?(\d{1,2})\s*[\).:]|[-*•●])\s*(.+?)\s*$")
+_O_LINE = re.compile(
+    r"^\s*(?:option\s*([0-9a-zA-Z])\s*[:.\)]|\(?([a-hA-H])\s*[\).]|"
+    r"[-*•●])\s*(.*)$")
 
 
 def parse_clarification(response):
     """Pull the clarification template apart: marker, questions, options.
 
-    Returns {marker, questions: [{text, options: [...]}], n_questions,
-    n_options, well_formed}. Tolerant about layout because the template is
-    only known by example: numbered or unnumbered questions, options as
-    a) / 1. / - / bullet. What it will NOT do is invent a question where
-    the response has none.
+    Returns {marker, questions: [{text, options}], n_questions, n_options,
+    well_formed}. An option's text may be empty - 'option b:' on its own
+    is still an option - so nothing here requires text after the label.
     """
     text = str(response or "")
-    low  = text.lower()
-    marker = next((m for m in CLARIFY_MARKERS if m in low), "")
+    marker = next((m for m in CLARIFY_MARKERS if m in text.lower()), "")
 
     questions, current = [], None
     for raw in text.split("\n"):
         line = raw.strip()
         if not line:
             continue
-        om = _OPTION_LINE.match(line)
-        # an option line that is itself a question belongs to the question
-        # list only if we have not opened one yet
-        if om and current is not None and not line.endswith("?"):
-            current["options"].append(om.group(1).strip())
-            continue
-        qm = _QUESTION_LINE.match(line)
-        if qm:
-            current = {"text": qm.group(1).strip(), "options": []}
+        om = _O_LINE.match(line)
+        is_option = bool(om) and bool(om.group(1) or om.group(2) or
+                                      line[:1] in "-*•●")
+        qm = _Q_LINE.match(line)
+        # a numbered line is a question in this template, never an option
+        if qm and qm.group(1):
+            current = {"text": qm.group(2).strip(), "options": []}
             questions.append(current)
             continue
-        if om and current is not None:
-            current["options"].append(om.group(1).strip())
+        if is_option:
+            if current is None:            # options before any question
+                current = {"text": "", "options": []}
+                questions.append(current)
+            current["options"].append((om.group(3) or "").strip())
+            continue
+        # an unnumbered line ending in '?' is still a question
+        if line.endswith("?"):
+            current = {"text": line, "options": []}
+            questions.append(current)
 
     n_q = len(questions)
     n_o = sum(len(q["options"]) for q in questions)
-    # "well formed" means it looks like the template we were told about:
-    # the marker, roughly the expected number of questions, and options
-    # hanging off them. Used for diagnosis, never to clear a flag.
-    well = bool(marker) and n_q >= 1 and n_o >= 1
+    well = bool(marker) and n_q >= 1
     return {"marker": marker, "questions": questions,
             "n_questions": n_q, "n_options": n_o, "well_formed": well}
 
@@ -2290,6 +2317,354 @@ def _stated(text, min_words=4):
     return len(re.findall(r"[A-Za-z][\w'-]*", t)) >= min_words
 
 
+# --------------------------------------------------------------------------
+# GROUNDING
+# --------------------------------------------------------------------------
+# A claim about the retrieved policy text must be supported by the
+# retrieved policy text. Without this check the judge can assert a chunk
+# said something while quoting the user's own words back, and the finding
+# looks fully evidenced.
+MIN_GROUNDED_QUOTES = 1          # per finding, for the flags listed below
+
+# Flags whose finding asserts something about the CHUNKS. For each, the
+# quote must be locatable in the chunk text - not in the request, not in
+# the response.
+#
+#   (finding, clean, unknown_is_safe)
+#
+# unknown_is_safe says whether UNKNOWN can be written into this flag
+# WITHOUT changing a downstream decision. It is safe only when every rule
+# that reads the flag tests it against its FINDING value: both FALSE and
+# UNKNOWN then fail that test identically. It is NOT safe when a rule
+# tests the flag against its CLEAN value, because UNKNOWN fails a test
+# that FALSE would have passed, and the rule silently stops firing.
+#
+# CHUNKS_ON_TOPIC is the case in point: its clean value is TRUE and a rule
+# tests "== TRUE", so an UNKNOWN there would quietly disable that rule.
+# Where UNKNOWN is unsafe we demote to the clean value instead, and the
+# flag is still listed in ungrounded_flags so nothing is lost but the
+# misleading verdict.
+CHUNK_CLAIM_FLAGS = {
+    "ANSWER_CONTRADICTS_CHUNKS":           TRUE,
+    "ANSWER_MISREADS_TABLE":               TRUE,
+    "ANSWER_OMITS_CONDITION_OR_EXCEPTION": TRUE,
+    "CHUNKS_CONFLICT":                     TRUE,
+    "CHUNKS_WRONG_APPLICABILITY":          TRUE,
+    "CHUNKS_RESOLVE_AMBIGUITY":            TRUE,
+    "CHUNKS_PARTIAL_COVERAGE":             TRUE,
+    "ANSWER_NUMBERS_UNSUPPORTED":          TRUE,
+    "CHUNKS_ON_TOPIC":                     FALSE,
+}
+
+# Findings serious enough that a paraphrased rationale is not enough: one
+# of them turning out to be unverifiable costs more than missing it.
+CRITICAL_GROUNDED_FLAGS = {
+    "ANSWER_CONTRADICTS_CHUNKS", "ANSWER_MISREADS_TABLE",
+    "CHUNKS_CONFLICT", "CHUNKS_WRONG_APPLICABILITY",
+    "CHUNKS_RESOLVE_AMBIGUITY",
+}
+
+_PUNCT_RE = re.compile(r"[^a-z0-9 ]+")
+
+
+def _flat(s):
+    return _PUNCT_RE.sub(" ", str(s or "").lower()).split()
+
+
+def grounded_in(quote, haystack, floor=0.6):
+    """Is this quote actually present in that text?
+
+    Verbatim containment first, then a content-word overlap fallback,
+    because a judge quote is often lightly re-punctuated. Returns the
+    score so the caller can say how close it was.
+    """
+    q, h = _flat(quote), _flat(haystack)
+    if not q:
+        return 0.0
+    if " ".join(q) in " ".join(h):
+        return 1.0
+    long_q = [w for w in q if len(w) > 3]
+    if not long_q:
+        return 0.0
+    hs = set(h)
+    return round(sum(1 for w in long_q if w in hs) / len(long_q), 2)
+
+
+# --------------------------------------------------------------------------
+# FLAG POLARITY
+# --------------------------------------------------------------------------
+# Each flag has a value that means "nothing to report here". It is NOT
+# always FALSE, and it is NOT always TRUE - it is whatever that flag's own
+# definition frames as the unremarkable case. Read the FALSE text of each
+# definition and it says so outright: "otherwise", "or there is no
+# history", "everything the request needs is present". For the handful of
+# flags that describe the agent doing its job properly, the unremarkable
+# case is TRUE instead.
+#
+# This matters because an UNKNOWN reaching a rule does not abstain. A rule
+# testing "== TRUE" stops firing; a rule testing "!= TRUE" starts firing.
+# Which of those is the safe direction depends entirely on the flag, so
+# there is no single correct substitute - only a per-flag one.
+#
+#   defect    TRUE reports a problem           -> default FALSE
+#   quality   TRUE reports the agent did well  -> default TRUE
+#   condition a fact about the inputs, where
+#             the definition's FALSE branch is
+#             the "otherwise" case              -> default FALSE
+#
+# The raw UNKNOWN is not thrown away: it is written to uncertain_flags so
+# calibration can see what the judge could not decide, while the rules see
+# a value that cannot misfire.
+FLAG_POLARITY = {
+    # ---- quality: TRUE means the agent did this correctly -------------
+    "ANSWER_ADDRESSES_QUESTION":           ("quality", TRUE),
+    "ANSWER_COVERS_ALL_PARTS":             ("quality", TRUE),
+    "ANSWER_ACKNOWLEDGES_LIMITATION":      ("quality", TRUE),
+    "NEXT_STEP_PROVIDED":                  ("quality", TRUE),
+    "CHUNKS_ON_TOPIC":                     ("quality", TRUE),
+
+    # ---- defect: TRUE reports a problem -------------------------------
+    "ANSWER_CONTRADICTS_CHUNKS":           ("defect", FALSE),
+    "ANSWER_MISREADS_TABLE":               ("defect", FALSE),
+    "ANSWER_OMITS_CONDITION_OR_EXCEPTION": ("defect", FALSE),
+    "ANSWER_HAS_UNSUPPORTED_CLAIM":        ("defect", FALSE),
+    "ANSWER_NUMBERS_UNSUPPORTED":          ("defect", FALSE),
+    "ANSWERED_WITH_SILENT_ASSUMPTION":     ("defect", FALSE),
+    "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY": ("defect", FALSE),
+    "ACTION_CLAIMED_PERFORMED":            ("defect", FALSE),
+    "RESPONSE_HAS_GREETING_OR_SMALLTALK":  ("defect", FALSE),
+    "REFUSAL_LEAKS_SUBSTANCE":             ("defect", FALSE),
+    "REFUSAL_REASON_INACCURATE":           ("defect", FALSE),
+    "CLARIFICATION_UNNECESSARY":           ("defect", FALSE),
+    "CLARIFICATION_VAGUE":                 ("defect", FALSE),
+    "CLARIFY_QUESTION_DIVERTS":            ("defect", FALSE),
+    "CHUNKS_CONFLICT":                     ("defect", FALSE),
+    "CHUNKS_WRONG_APPLICABILITY":          ("defect", FALSE),
+    "CHUNKS_PARTIAL_COVERAGE":             ("defect", FALSE),
+
+    # ---- condition: a fact about the inputs ---------------------------
+    # Each of these has a definition whose FALSE branch is explicitly the
+    # default case, so FALSE is what "I could not tell" must mean. Two of
+    # them can ground a finding either way - REQUEST_IS_AMBIGUOUS and
+    # REQUEST_IS_TOPIC_CHANGE - and FALSE is still right: it says "this
+    # request is ordinary and continues the thread", which is the claim
+    # that assumes least.
+    "REQUEST_IS_AMBIGUOUS":                ("condition", FALSE),
+    "REQUEST_IS_TOPIC_CHANGE":             ("condition", FALSE),
+    "REQUEST_IS_PROCEDURAL":               ("condition", FALSE),
+    "REQUEST_IS_DOCUMENT_LOCATION":        ("condition", FALSE),
+    "REQUEST_IS_ADVERSARIAL":              ("condition", FALSE),
+    "REQUEST_NEEDS_USER_SPECIFIC_DATA":    ("condition", FALSE),
+    "AUDIT_INPUT_LIMITED":                 ("condition", FALSE),
+    "HISTORY_HAS_NEEDED_INFO":             ("condition", FALSE),
+    "CHUNKS_RESOLVE_AMBIGUITY":            ("condition", FALSE),
+}
+
+
+def normalize_unknowns(f):
+    """Resolve every UNKNOWN to its flag's own unremarkable value.
+
+    Runs before any rule reads the flags, and catches the value however it
+    arrived - judge-returned, or written by a gate. Returns notes naming
+    what was resolved, so an UNKNOWN is recorded rather than erased.
+    """
+    notes = []
+    for flag, val in list(f.items()):
+        if val != UNKNOWN:
+            continue
+        spec = FLAG_POLARITY.get(flag)
+        if not spec:
+            continue            # code-set or derived flag: leave it alone
+        kind, default = spec
+        f[flag] = default
+        why = ("the agent keeps the benefit of the doubt"
+               if default == TRUE
+               else "nothing is asserted against the agent")
+        notes.append(f"{flag}: UNKNOWN read as {default} "
+                     f"({kind} flag - {why})")
+    return notes
+
+
+def enforce_grounding(f, ev, chunk_text="", request_text="",
+                      history_text="", record=None):
+    """Check every chunk claim against the chunks. Returns notes.
+
+    Four things are enforced here, all of them the same idea - a finding
+    must rest on the source it claims to rest on:
+
+      * a chunk claim must quote the chunks
+      * quoting the user's own words for a chunk claim is a contradiction
+        in terms, and is called out as such rather than merely demoted
+      * a critical finding needs at least one verbatim span, not only a
+        paraphrased rationale
+      * below the minimum the flag becomes UNKNOWN, not FALSE: we are
+        saying we could not confirm it, which is not the same as saying
+        it did not happen
+    """
+    notes = []
+    record = record if record is not None else []
+    has_chunks = bool(str(chunk_text or "").strip())
+
+    def park(flag, reason):
+        """Take an unsupported finding off the books, safely.
+
+        UNKNOWN where it changes nothing downstream, the clean value where
+        it would. Either way the flag is recorded, so "we could not
+        confirm this" stays visible without steering a verdict.
+        """
+        # park it at the flag's own unremarkable value. UNKNOWN is not
+        # used here: it would reach the rules, and what an UNKNOWN does
+        # to a rule depends on the flag rather than on our intent.
+        f[flag] = FLAG_POLARITY.get(flag, ("defect", FALSE))[1]
+        record.append(flag)
+        notes.append(f"{flag} -> {f[flag]} "
+                     f"(INSUFFICIENT_GROUNDED_EVIDENCE): {reason}")
+
+    for flag, finding in CHUNK_CLAIM_FLAGS.items():
+        if f.get(flag) != finding:
+            continue
+
+        # cross-field: a claim about chunks is incoherent with no chunks
+        if not has_chunks:
+            park(flag, "claims something about the retrieved chunks, but no "
+                       "chunks were retrieved")
+            continue
+
+        d = ev_fields(ev.get(flag))
+        spans = [x for x in (d["quote"], d["source_states"]) if x]
+        if not spans:
+            park(flag, "no quoted span, only a paraphrase")
+            continue
+
+        best = max(grounded_in(x, chunk_text) for x in spans)
+        if best >= 0.6:
+            continue                       # grounded
+
+        # Not in the chunks. Did it quote the user instead?
+        user_hit = max([grounded_in(x, request_text) for x in spans] +
+                       [grounded_in(x, history_text) for x in spans])
+        if user_hit >= 0.6:
+            # This one is not merely unconfirmed, it is wrong: the finding
+            # cites the user's own words as policy text. Clean value, not
+            # UNKNOWN.
+            f[flag] = FLAG_POLARITY.get(flag, ("defect", FALSE))[1]
+            record.append(flag)
+            notes.append(f"{flag} -> {f[flag]}: evidence quotes the user's own "
+                         f"text, not the retrieved chunks, for a claim about "
+                         f"the chunks (chunk match {best}, user match "
+                         f"{user_hit})")
+        else:
+            park(flag, f"quoted span is not locatable in any retrieved chunk "
+                       f"(best match {best})")
+
+    # CHUNKS_RESOLVE_AMBIGUITY carries real weight: it is a ground for
+    # calling a clarification unnecessary. It may not stand on a chunk
+    # claim that was just demoted for lack of support.
+    if (f.get("CHUNKS_RESOLVE_AMBIGUITY") == TRUE
+            and f.get("RETRIEVAL_RETURNED_CHUNKS") == FALSE):
+        f["CHUNKS_RESOLVE_AMBIGUITY"] = FALSE
+        notes.append("CHUNKS_RESOLVE_AMBIGUITY demoted: cannot resolve an "
+                     "ambiguity from chunks when retrieval returned none")
+    return notes
+
+
+# --------------------------------------------------------------------------
+# TOPIC CONTINUITY
+# --------------------------------------------------------------------------
+# REQUEST_IS_TOPIC_CHANGE is load-bearing: a topic change excuses the agent
+# from carrying prior context, so a false TRUE hides a real continuity
+# failure. The judge reads "new question" as "new topic" too readily, and
+# it has no policy taxonomy to tell it that pre-clearance and holding
+# periods are the same subject.
+#
+# This is a lexical check on purpose. It costs no tokens, and the question
+# it answers - does this request reuse the previous turn's vocabulary - is
+# exactly the kind a word comparison answers well.
+TOPIC_RECENCY_TURNS = 2      # how far back "the current topic" extends
+TOPIC_OVERLAP_SAME  = 0.25   # >= this share of content words reused = same topic
+TOPIC_STEM_LEN      = 6      # prefix length: "preclearance" and "precleared" must match
+
+_TOPIC_STOP = {
+    "what", "which", "where", "when", "does", "do", "did", "is", "are", "was",
+    "the", "a", "an", "for", "of", "to", "in", "on", "and", "or", "if", "can",
+    "could", "should", "would", "i", "my", "me", "we", "our", "you", "your",
+    "it", "this", "that", "there", "need", "have", "has", "any", "about",
+    "policy", "policies", "standard", "standards", "document", "documents",
+    "please", "tell", "know", "like", "want", "how",
+    # generic policy verbs and qualifiers. These recur in every question
+    # regardless of subject, so counting them as shared vocabulary merges
+    # unrelated topics: "is pre-clearance required" and "is registration
+    # required for gifts" share only the word "required".
+    "require", "required", "requires", "requirement", "allow", "allowed",
+    "permit", "permitted", "apply", "applies", "applicable", "mean", "means",
+    "available", "find", "get", "provide", "provided", "rule", "rules",
+    "process", "procedure", "happen", "work", "works", "take", "make",
+}
+
+
+def _topic_words(text):
+    """Content words, prefix-stemmed and dehyphenated.
+
+    The stem is what makes this work at all: "pre-clearance" and
+    "pre-cleared" are the same subject and different strings, and a raw
+    word comparison scores them zero.
+    """
+    out = set()
+    for w in re.findall(r"[a-z][a-z0-9'-]{2,}", str(text).lower()):
+        if w in _TOPIC_STOP:
+            continue
+        bare = w.replace("-", "").replace("'", "")
+        if bare in _TOPIC_STOP or len(bare) < 3:
+            continue
+        out.add(bare[:TOPIC_STEM_LEN])
+    return out
+
+
+def check_topic_change(f, request_text, history, static_prev=False):
+    """Correct REQUEST_IS_TOPIC_CHANGE against the recent turns. Returns notes.
+
+    Two rules, in this order:
+
+      RESET  if the conversation hit a boundary on the previous turn - a
+             static refusal, or a clarification the user never answered -
+             the thread is broken and a new request is a new topic
+             whatever it looks like. An older similar ask must not
+             suppress a genuine change.
+
+      REUSE  otherwise, if the request reuses enough of the recent user
+             turns' vocabulary, it continues that subject, and TRUE is
+             wrong however new the wording looks.
+    """
+    notes = []
+    if f.get("REQUEST_IS_TOPIC_CHANGE") != TRUE:
+        return notes
+
+    user_turns = [m.get("content", "") for m in (history or [])
+                  if isinstance(m, dict) and m.get("role") == "user"]
+    if not user_turns:
+        return notes                       # nothing to continue from
+
+    if static_prev:
+        return notes                       # boundary: the change stands
+
+    recent = user_turns[-TOPIC_RECENCY_TURNS:]
+    cur = _topic_words(request_text)
+    if not cur:
+        return notes
+    best, shared = 0.0, set()
+    for t in recent:
+        prev = _topic_words(t)
+        if prev and len(cur & prev) / len(cur) > best:
+            best, shared = len(cur & prev) / len(cur), cur & prev
+    if best >= TOPIC_OVERLAP_SAME and shared:
+        f["REQUEST_IS_TOPIC_CHANGE"] = FALSE
+        notes.append(f"REQUEST_IS_TOPIC_CHANGE demoted: {best:.0%} of this "
+                     f"request's content words also appear in the previous "
+                     f"{len(recent)} user turn(s), so it continues that "
+                     f"subject (shared: {', '.join(sorted(shared))})")
+    return notes
+
+
 def enforce_evidence_quality(f, ev, response_text=""):
     """Demote flags whose evidence does not meet the bar stated in the prompt.
 
@@ -2574,9 +2949,33 @@ def finish(st):
     route = st["route"]
     f     = st["flags"]
     # Demote flags whose evidence is too weak to verify, BEFORE anything
-    # downstream reads them.
-    demoted = enforce_evidence_quality(f, st["ev"],
-                                       st["row"].get("response", ""))
+    # downstream reads them. Order matters: grounding first, because a
+    # claim that does not rest on the chunks it cites should never reach
+    # the gates that reason about what it says.
+    c = st["ctx"]
+    chunk_text = "\n".join(ch.get("text", "") for ch in (c["chunks"] or []))
+    hist = c["history"] or []
+    hist_text = "\n".join(m.get("content", "") for m in hist
+                          if isinstance(m, dict))
+    # A static refusal on the previous turn is a conversation boundary:
+    # the thread was cut there, so the next request starts a topic of its
+    # own however much vocabulary it shares with what came before.
+    prev_bot = next((m.get("content", "") for m in reversed(hist)
+                     if isinstance(m, dict)
+                     and m.get("role") == "assistant"), "")
+    static_prev = bool(prev_bot) and norm(prev_bot) in {
+        norm(k) for k in STATIC_TEMPLATES}
+    st["ungrounded"] = []
+    st["uncertain"]  = sorted(k for k, v in f.items()
+                              if v == UNKNOWN and k in FLAG_POLARITY)
+    demoted = normalize_unknowns(f)
+    demoted += enforce_grounding(f, st["ev"], chunk_text,
+                                st["row"].get("request", ""), hist_text,
+                                record=st["ungrounded"])
+    demoted += check_topic_change(f, st["row"].get("request", ""),
+                                  hist, static_prev)
+    demoted += enforce_evidence_quality(f, st["ev"],
+                                        st["row"].get("response", ""))
 
     f.update(derive(route, f))
 
@@ -2654,6 +3053,14 @@ def finish(st):
                                   for x in v["reasons"]
                                   if not x.startswith(("AUDIT_ERROR",
                                                        "VALIDATION"))),
+        # findings we could not confirm against the chunks. Recorded
+        # whether they were parked as UNKNOWN or written down to their
+        # clean value, so calibration sees all of them.
+        "ungrounded_flags":   "; ".join(sorted(set(st.get("ungrounded")
+                                                   or []))),
+        # what the judge could not decide, kept for calibration. The rules
+        # saw each flag's unremarkable value instead, never an UNKNOWN.
+        "uncertain_flags":    "; ".join(st.get("uncertain") or []),
         "validation_notes":   "; ".join(
                                   filter(None, [v["validation_notes"],
                                                 "; ".join(demoted),
