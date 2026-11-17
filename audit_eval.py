@@ -236,6 +236,7 @@ def _load_corpus(path):
             continue
     raise ValueError(f"could not decode {path} in any of {_ENCODINGS}")
 
+
 CORPUS_INDEX = _load_corpus(CORPUS_INDEX_PATH)
 
 # Product decision: should "adjacent" (HR-flavoured, no policy covers it) be in scope?
@@ -556,12 +557,50 @@ Quote the evidence first, then give the decision.
 Decisions: TRUE | FALSE | UNKNOWN.
 UNKNOWN = the evidence needed is absent from the input. NOT for hard cases.
 
-OUTPUT RULES — follow exactly, output is token-limited:
-- Keep each "evidence" under 15 words. A short quote or phrase, not a sentence.
+OUTPUT RULES — follow exactly.
+
+Every flag has one decision that REPORTS A PROBLEM. For most flags that is
+TRUE. For flags whose healthy state is TRUE — ANSWER_COVERS_ALL_PARTS,
+ANSWER_ADDRESSES_QUESTION, NEXT_STEP_PROVIDED, CHUNKS_ON_TOPIC — it is FALSE.
+
+When your decision does NOT report a problem, return the decision alone:
+    {"decision": "FALSE"}
+No evidence, no explanation. Most flags will look like this.
+
+When your decision DOES report a problem, it is a finding, and a finding
+must be understandable BY ITSELF — by a reader who cannot see the request,
+the response or the policy text. Return:
+    {"decision": "TRUE",
+     "answer_claims": "<what the answer asserts, as a COMPLETE statement>",
+     "source_states": "<what the policy text states on the same point, as a
+                       COMPLETE statement>",
+     "source_ref":    "<document title, and the table row or clause>",
+     "quote":         "<short verbatim fragment from the chunk>"}
+
+A COMPLETE statement carries its own subject and condition. Write the
+sentence out; do not quote a fragment:
+    GOOD  answer_claims: "registration is required for a $150 gift"
+    BAD   answer_claims: "registration required"
+    GOOD  source_states: "gifts from $25 up to $200 require no registration"
+    BAD   source_states: "$25 and up to $200 | No"
+A table cell is never a complete statement. "No" is an answer to a question
+you must write out: name the column and the row it sits in.
+
+If the problem is something MISSING, source_states says what the policy
+requires and answer_claims says what the answer gave instead, or
+"not addressed".
+If the problem is something the answer ASSERTS WITHOUT SUPPORT,
+source_states is "no chunk states this".
+
+If you cannot write both statements completely, you have not found a
+problem you can prove — answer FALSE.
+
+- "quote" is for checking only. It may be a fragment. The two statements
+  must stand without it.
 - No preamble, no markdown fences, no trailing commentary. JSON object only.
 - Include every flag listed below, exactly once.
 
-Return JSON only: {"FLAG_NAME": {"evidence": "...", "decision": "TRUE|FALSE|UNKNOWN"}}"""
+Return JSON only: {"FLAG_NAME": {...as above...}}"""
 
 SCOPE_TEXT = (
     "\n\nSCOPE_CATEGORY: pick exactly one from the corpus index and the request text, "
@@ -689,9 +728,11 @@ CALLS = {
                 "given to you already split, one row per line, every cell written as "
                 "'<header>=<value>'. A value belongs ONLY to the row it is printed "
                 "under. To decide, take each figure the answer states, find the row it "
-                "names, and check that figure against THAT row's cells. Evidence MUST "
-                "quote the row and the answer's claim as 'row: <row> || answer: "
-                "<claim>'.",
+                "names, and check that figure against THAT row's cells. source_states must "
+                "name the COLUMN and the ROW as a sentence - 'for the $25-$200 gift "
+                "row, registration required is No' - never the bare cell value, "
+                "which means nothing on its own. answer_claims states what the "
+                "answer asserted for that same row.",
                 "FALSE: no table in the chunks, or every value the answer cites sits in "
                 "the row it is attributed to. Also FALSE if the answer simply omits "
                 "rows, or reports the table correctly but in prose."),
@@ -699,8 +740,10 @@ CALLS = {
                 "TRUE only for a DIRECT factual contradiction a reader would spot "
                 "immediately: the chunk says X and the answer says not-X, or a different "
                 "number, date, threshold, approver or outcome for the same thing. "
-                "Evidence MUST quote BOTH sides in the form "
-                "'chunk: <quote> || answer: <quote>'. If you cannot quote both, answer FALSE.",
+                "State BOTH sides as complete sentences: answer_claims is what "
+                "the answer asserts, source_states is what the chunk states on the "
+                "SAME point. The conflict must be visible from those two sentences "
+                "alone. If you cannot write both completely, answer FALSE.",
                 "READ THE WHOLE ANSWER FIRST. If the answer states the chunk's position "
                 "ANYWHERE — in a later clause, a caveat, an exception, a 'however', a "
                 "bullet further down — there is NO contradiction, and the decision is "
@@ -721,7 +764,8 @@ CALLS = {
             "ANSWER_ASSERTS_PERSONAL_ELIGIBILITY": (
                 "TRUE only if BOTH hold: (a) the answer depends on a fact about THIS user "
                 "(their role, grade, tenure, holdings, status) and (b) the agent decided that "
-                "fact instead of asking. Evidence MUST name the person-specific fact decided. "
+                "fact instead of asking. source_states MUST name the person-specific "
+                "fact the agent decided rather than asked. "
                 "Second-person wording alone is NOT enough.",
                 "FALSE whenever the rule is categorical — it turns on the instrument, product "
                 "or transaction type rather than on who is asking. Saying 'you do not need "
@@ -730,8 +774,10 @@ CALLS = {
             "ANSWERED_WITH_SILENT_ASSUMPTION": (
                 "TRUE: the answer depends on a specific fact about the user that was never "
                 "stated and is not in the chunks (their role, region, grade, holding type, "
-                "employment status). Evidence MUST name the assumed fact in the form "
-                "'assumed: <fact>'. If you cannot name one specific assumed fact, answer FALSE.",
+                "employment status). answer_claims states the assertion that depends on the "
+                "unstated fact; source_states names it as 'assumed: <fact>; not stated "
+                "in request, history or chunks'. If you cannot name one specific "
+                "assumed fact, answer FALSE.",
                 "FALSE: the answer holds regardless of unstated details, or the answer "
                 "explicitly states its assumption, or the rule is unconditional."),
             "ACTION_CLAIMED_PERFORMED": (
@@ -803,13 +849,14 @@ CALLS = {
                 "  (a) ALREADY ANSWERED - the information the clarification "
                 "asks for is already stated in the CURRENT USER REQUEST or in "
                 "the CONVERSATION HISTORY. Evidence MUST quote the clarifying "
-                "question and the text that already supplies the answer, as "
-                "'asked: <question> || already given: <quote>'.\n"
+                "answer_claims is the clarifying question asked, source_states is "
+                "the sentence that already supplies the answer and where it came "
+                "from (request or history).\n"
                 "  (b) DIVERTS - the clarification asks about something that "
                 "does not bear on the request at all, so no answer to it "
                 "would change the policy answer. Evidence MUST quote the "
-                "request and the off-topic question as 'request: <quote> || "
-                "asked instead: <question>'.\n"
+                "answer_claims is the off-topic question asked, source_states is "
+                "what the request actually needed to be answered.\n"
                 "The response asks SEVERAL questions. Set TRUE only if EVERY "
                 "question it asks falls under (a) or (b). If even one question "
                 "asks for something genuinely needed and not yet supplied, "
@@ -907,6 +954,65 @@ CHUNK_SPLIT_KEY = None      # e.g. "FILE_NAME"; None = auto-detect
 
 # A markdown pipe row: |a|b|c|
 PIPE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+# |---|:--:|---| and friends: dashes only, at least one dash
+_SEP_ROW = re.compile(r"^[\s|:-]*-[\s|:-]*$")
+_ESCAPED = "\x00"
+
+
+def split_row(line):
+    """One pipe row -> cells, POSITION PRESERVED.
+
+    Strips exactly ONE leading and ONE trailing pipe, never more. The
+    obvious .strip('|') is greedy: on '||Amount|Registration|' it eats the
+    empty first cell, every column shifts left by one, and each header
+    then labels its neighbour's value. An empty cell is still a cell.
+    """
+    s = str(line).strip().replace(r"\|", _ESCAPED)   # escaped pipe is data
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.replace(_ESCAPED, "|").strip() for c in s.split("|")]
+
+
+def parse_table(lines):
+    """Pipe rows -> [header, row, row, ...] with every row the same width.
+
+    Rows are padded, never truncated: a short row keeps its cells in their
+    original columns rather than sliding left.
+    """
+    rows = [split_row(l) for l in lines if not _SEP_ROW.match(l.strip())]
+    rows = [r for r in rows if any(c for c in r)]
+    if not rows:
+        return []
+    w = max(len(r) for r in rows)
+    return [r + [""] * (w - len(r)) for r in rows]
+
+
+def render_table(rows):
+    """Re-emit a table with its header named on every value.
+
+    Read like `spark.show()`: column i of the header belongs to column i
+    of each row, positionally, whether or not either is blank. A model
+    reading '|$25 and up to $200|No|' has to remember the column order and
+    which row it is on; that is the mistake this audit keeps finding, and
+    a quote of that row carries no header at all. Naming the column beside
+    each value removes both problems.
+    """
+    if not rows:
+        return ""
+    head, body = rows[0], rows[1:]
+    head = [h if h else f"col{i + 1}" for i, h in enumerate(head)]
+    if not body:
+        return "TABLE (header only): " + " | ".join(head)
+    out = ["TABLE  columns: " + " | ".join(head),
+           "  (each row is listed column by column; a value belongs ONLY to "
+           "the row it is printed under)"]
+    for i, r in enumerate(body, 1):
+        cells = [f"{head[j]}={v if v else '(blank)'}"
+                 for j, v in enumerate(r)]
+        out.append(f"  row {i}: " + "; ".join(cells))
+    return "\n".join(out)
 
 
 def clean_key(k):
@@ -980,8 +1086,7 @@ def split_table_segments(value):
     segs, run, buf = [], [], []
 
     def flush_table():
-        rows = [[c.strip() for c in r.strip().strip("|").split("|")]
-                for r in run if not re.fullmatch(r"[\s|:-]+", r)]
+        rows = parse_table(run)
         if len(rows) >= 2:
             segs.append(("table", rows))
         else:
@@ -1007,27 +1112,6 @@ def split_table_segments(value):
         flush_table()
     flush_text()
     return segs
-
-
-def render_table(rows):
-    """Re-emit a table with its header named on every row.
-
-    A model reading '|EMEA|USD 50,000|' has to remember which column is
-    which and which row it is on; that is exactly the mistake this audit
-    keeps finding. Naming the header beside each value removes the step.
-    """
-    if not rows:
-        return ""
-    head, body = rows[0], rows[1:]
-    if not body:
-        return "| " + " | ".join(head) + " |"
-    out = ["TABLE (each row listed field by field; a value belongs ONLY to "
-           "the row it is printed under):"]
-    for i, r in enumerate(body, 1):
-        cells = [f"{head[j] if j < len(head) else f'col{j+1}'}={v}"
-                 for j, v in enumerate(r)]
-        out.append(f"  row {i}: " + "; ".join(cells))
-    return "\n".join(out)
 
 
 # Which key holds the title, in order of preference. Matched against the
@@ -2153,6 +2237,59 @@ _STOPWORDS = {
 }
 
 
+_NEG_RE = re.compile(
+    r"\b(?:not|no|never|cannot|can't|don't|doesn't|isn't|aren't|won't|"
+    r"without|exempt|excluded|prohibited|ineligible|need not|unnecessary)\b",
+    re.I)
+
+
+def ev_fields(entry):
+    """Evidence -> {answer_claims, source_states, source_ref, quote, raw}.
+
+    Reads the structured object the judge now returns, and still reads the
+    old flat 'chunk: X || answer: Y' string, so a checkpoint written by an
+    earlier run does not fail the gates below.
+    """
+    out = {"answer_claims": "", "source_states": "", "source_ref": "",
+           "quote": "", "raw": ""}
+    if isinstance(entry, dict):
+        for k in ("answer_claims", "source_states", "source_ref", "quote"):
+            v = entry.get(k)
+            if v:
+                out[k] = str(v).strip()
+        if not (out["answer_claims"] or out["source_states"]):
+            # an older entry: {"evidence": "chunk: X || answer: Y"}
+            return ev_fields(entry.get("evidence") or entry.get("quote") or "")
+        out["raw"] = " ".join(v for v in out.values() if v)
+        return out
+    text = str(entry or "").strip()
+    out["raw"] = text
+    if "||" in text:
+        a, b = text.split("||", 1)
+        lead = lambda x: re.sub(r"^\s*\w[\w ]{0,18}:\s*", "", x).strip()
+        if re.match(r"\s*(chunk|row|source|history|request)\b", a, re.I):
+            out["source_states"], out["answer_claims"] = lead(a), lead(b)
+        else:
+            out["answer_claims"], out["source_states"] = lead(a), lead(b)
+    else:
+        out["answer_claims"] = text
+    return out
+
+
+def _stated(text, min_words=4):
+    """Is this a statement a reader could judge, or a stray fragment?
+
+    A complete statement has a subject and a predicate. We cannot parse
+    for that cheaply, but a fragment like 'No' or '$25-$200 | No' fails on
+    word count or on still carrying a pipe, and those are the two shapes
+    that made findings unreadable.
+    """
+    t = str(text or "").strip()
+    if not t or "|" in t:
+        return False
+    return len(re.findall(r"[A-Za-z][\w'-]*", t)) >= min_words
+
+
 def enforce_evidence_quality(f, ev, response_text=""):
     """Demote flags whose evidence does not meet the bar stated in the prompt.
 
@@ -2164,7 +2301,8 @@ def enforce_evidence_quality(f, ev, response_text=""):
 
     # silent assumption must name the assumed fact
     if f.get("ANSWERED_WITH_SILENT_ASSUMPTION") == TRUE:
-        e = str(ev.get("ANSWERED_WITH_SILENT_ASSUMPTION", "")).lower()
+        d = ev_fields(ev.get("ANSWERED_WITH_SILENT_ASSUMPTION"))
+        e = (d["source_states"] + " " + d["raw"]).lower()
         if "assumed" not in e or len(e) < 12:
             f["ANSWERED_WITH_SILENT_ASSUMPTION"] = FALSE   # not UNKNOWN:
             # an unverifiable finding is treated as no finding, so it does
@@ -2174,10 +2312,14 @@ def enforce_evidence_quality(f, ev, response_text=""):
 
     # personal eligibility must name a person-specific fact the agent decided
     if f.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY") == TRUE:
-        e = str(ev.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY", "")).lower()
+        d = ev_fields(ev.get("ANSWER_ASSERTS_PERSONAL_ELIGIBILITY"))
+        e = (d["source_states"] + " " + d["raw"]).lower()
+        # 'exempt' is NOT a person fact: an exemption is a property of the
+        # instrument and applies to everyone holding it. Keeping it here
+        # preserved the exact false positive this flag was tightened for.
         person_fact = re.search(
             r"\brole\b|\bgrade\b|\btenure\b|\bstatus\b|\bholding\b|"
-            r"\beligib|\bqualif|\bapprov|\bentitl|\bexempt\b", e)
+            r"\beligib|\bqualif|\bentitl", e)
         if not person_fact or len(e) < 12:
             f["ANSWER_ASSERTS_PERSONAL_ELIGIBILITY"] = FALSE
             notes.append("personal_eligibility demoted: evidence names no "
@@ -2185,57 +2327,60 @@ def enforce_evidence_quality(f, ev, response_text=""):
 
     # table misread must quote the row and the claim
     if f.get("ANSWER_MISREADS_TABLE") == TRUE:
-        e = str(ev.get("ANSWER_MISREADS_TABLE", ""))
-        if "||" not in e or len(e) < 20:
+        d = ev_fields(ev.get("ANSWER_MISREADS_TABLE"))
+        if not (_stated(d["answer_claims"]) and _stated(d["source_states"])):
             f["ANSWER_MISREADS_TABLE"] = FALSE
-            notes.append("table_misread demoted: evidence does not quote "
-                         "the table row and the answer's claim")
+            notes.append("table_misread demoted: evidence does not state the "
+                         "column and row as a sentence - a bare cell value "
+                         "cannot be checked")
 
     # contradiction must quote BOTH the chunk and the answer. Without both
     # sides a reviewer cannot confirm it, and in practice these turn out to
     # be omissions or partial coverage rather than real conflicts.
     if f.get("ANSWER_CONTRADICTS_CHUNKS") == TRUE:
-        e = str(ev.get("ANSWER_CONTRADICTS_CHUNKS", ""))
-        has_both = ("||" in e) or (
-            re.search(r"\bchunk\b", e, re.I) and
-            re.search(r"\banswer\b|\bresponse\b", e, re.I))
-        if not has_both or len(e) < 20:
+        d = ev_fields(ev.get("ANSWER_CONTRADICTS_CHUNKS"))
+        ans, src = d["answer_claims"], d["source_states"]
+        if not (_stated(ans) and _stated(src)):
             f["ANSWER_CONTRADICTS_CHUNKS"] = FALSE
-            notes.append("contradiction demoted: evidence does not quote "
-                         "both the chunk and the answer")
-        elif response_text and "||" in e:
-            # The judge may have quoted only a fragment of the answer. If the
-            # chunk's own distinctive words appear SOMEWHERE in the full
-            # response, the answer states the chunk's position and there is
-            # no contradiction — the fragment just hid the later clause.
-            chunk_side = e.split("||")[0]
-            chunk_side = re.sub(r"^\s*chunk\s*:\s*", "", chunk_side,
-                                flags=re.I)
-            resp_low = response_text.lower()
-            terms = [w for w in re.findall(r"[A-Za-z][\w'-]{4,}", chunk_side)
-                     if w.lower() not in _STOPWORDS]
-            if terms:
-                hits = sum(1 for w in terms if w.lower() in resp_low)
-                if hits / len(terms) >= 0.6:
+            notes.append("contradiction demoted: both sides must be stated "
+                         "as complete sentences; a fragment cannot be "
+                         "checked against the answer")
+        else:
+            # Three outcomes, not two. The old rule flipped to FALSE
+            # whenever the chunk's words reappeared in the answer, which
+            # deleted every contradiction ABOUT A VALUE: "notice period is
+            # 90 days" and "notice period is 30 days" share every word
+            # that is not the point.
+            num = lambda t: {n.replace(",", "").rstrip(".")
+                             for n in re.findall(r"\d[\d,]*(?:\.\d+)?%?", t)}
+            cn, an = num(src), num(ans)
+            if cn and an and cn != an:
+                pass                      # values disagree: a real conflict
+            else:
+                terms = [w for w in re.findall(r"[A-Za-z][\w'-]{4,}", src)
+                         if w.lower() not in _STOPWORDS]
+                frag = {w.lower() for w in
+                        re.findall(r"[A-Za-z][\w'-]{4,}", ans)}
+                rest = [w for w in terms if w.lower() not in frag]
+                low = (response_text or "").lower()
+                overlap = (sum(1 for w in rest if w.lower() in low) / len(rest)
+                           if rest else 1.0)
+                flip = bool(_NEG_RE.search(src)) != bool(_NEG_RE.search(ans))
+                if overlap >= 0.6 and not flip:
                     f["ANSWER_CONTRADICTS_CHUNKS"] = FALSE
                     notes.append(
-                        f"contradiction demoted: the response already states "
-                        f"the chunk's position ({hits}/{len(terms)} of its key "
-                        f"terms appear in the answer) — likely quoted from a "
-                        f"fragment rather than the whole answer")
-    return notes
-
-
-def resolve_conflicts(f):
-    """Drop flags that cannot logically be TRUE given the other flags.
-
-    Without this, a judge mistake can raise a review on an impossible basis
-    — e.g. 'the answer contradicts the chunks' on a row where no chunks were
-    retrieved. A reviewer opening that row finds nothing to check and loses
-    confidence in the whole queue.
-    """
-    notes = []
-    no_chunks = f.get("RETRIEVAL_RETURNED_CHUNKS") == FALSE
+                        "contradiction demoted: the response already states "
+                        "the chunk's position elsewhere - quoted from a "
+                        "fragment rather than the whole answer")
+                elif overlap >= 0.6 and flip:
+                    # same words, opposite polarity. "required" vs "not
+                    # required" and "answer reconciles it later" look
+                    # identical to any lexical test, so neither auto-clear
+                    # nor auto-flag is honest here.
+                    f["ANSWER_CONTRADICTS_CHUNKS"] = UNKNOWN
+                    notes.append(
+                        "contradiction needs a human: the answer uses the "
+                        "chunk's own words with the opposite polarity")
 
     # 1. Cannot contradict, misread or be unsupported by chunks that do not exist.
     if no_chunks:
@@ -2836,12 +2981,16 @@ def all_causes_for(r):
         out.append(("decision", "no_next_step_in_template"))
 
     # ---- 5. generation ----------------------------------------------
-    if f("ANSWER_MISREADS_TABLE") == TRUE:
-        out.append(("generation", "answer_misread_table"))
-    if f("ANSWER_CONTRADICTS_CHUNKS") == TRUE:
-        out.append(("generation", "answer_contradicts_source"))
-    if f("ANSWER_COVERS_ALL_PARTS") == FALSE:
-        out.append(("generation", "answer_incomplete"))
+    # Only an ANSWER can be a defective answer. On a clarified or refused
+    # row there is nothing for these to describe, and without the guard a
+    # clarification picks up "answer_incomplete" as its cause.
+    if route == "answered":
+        if f("ANSWER_MISREADS_TABLE") == TRUE:
+            out.append(("generation", "answer_misread_table"))
+        if f("ANSWER_CONTRADICTS_CHUNKS") == TRUE:
+            out.append(("generation", "answer_contradicts_source"))
+        if f("ANSWER_COVERS_ALL_PARTS") == FALSE:
+            out.append(("generation", "answer_incomplete"))
     if "communication_quality" in themes and not out:
         out.append(("generation", "generation_or_communication"))
 
